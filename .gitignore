@@ -1,6 +1,10 @@
 # Rust build artifacts
 /target/
 
+# .NET predictor build artifacts (fork-specific)
+/predictor/bin/
+/predictor/obj/
+
 # Cargo lock (optional for binaries, included by default)
 # Cargo.lock
 

@@ -1,0 +1,47 @@
+name: build-predictor
+
+# Build the C# predictor sidecar binary on every push to a non-main branch
+# and on manual dispatch. Self-contained single-file publish (no AOT, no
+# MSVC dependency). Artifact is the ~35 MB ccum-predictor.exe.
+
+on:
+  push:
+    branches-ignore:
+      - main
+    paths:
+      - 'predictor/**'
+      - '.github/workflows/build-predictor.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: predictor
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: dotnet restore
+        run: dotnet restore
+
+      - name: dotnet build
+        run: dotnet build -c Release --no-restore
+
+      - name: dotnet publish (self-contained single-file)
+        run: dotnet publish -c Release -r win-x64 --self-contained true /p:PublishSingleFile=true --no-restore
+
+      - name: Upload predictor artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ccum-predictor-${{ github.sha }}
+          path: predictor/bin/Release/net9.0/win-x64/publish/ccum-predictor.exe
+          retention-days: 14

@@ -1,0 +1,53 @@
+name: upstream-sync
+
+# Daily attempt to merge upstream/main (CodeZeno/Claude-Code-Usage-Monitor)
+# into our main. Clean merges are pushed automatically; conflicts cause the
+# workflow to fail visibly — resolve manually from a local clone.
+
+on:
+  schedule:
+    - cron: '17 13 * * *'  # 13:17 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/CodeZeno/Claude-Code-Usage-Monitor.git
+
+      - name: Fetch upstream
+        run: git fetch upstream main
+
+      - name: Count upstream commits ahead
+        id: ahead
+        run: |
+          AHEAD=$(git rev-list --count HEAD..upstream/main)
+          echo "count=$AHEAD" >> "$GITHUB_OUTPUT"
+          echo "Upstream is $AHEAD commits ahead of main"
+
+      - name: Nothing to sync
+        if: steps.ahead.outputs.count == '0'
+        run: echo "Up to date with upstream."
+
+      - name: Merge upstream/main
+        if: steps.ahead.outputs.count != '0'
+        run: git merge --no-edit upstream/main
+
+      - name: Push merged main
+        if: steps.ahead.outputs.count != '0'
+        run: git push origin main
