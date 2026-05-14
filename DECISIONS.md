@@ -19,7 +19,7 @@ Fork CodeZeno's repo as the new baseline. Port the predecessor's predictor logic
 
 ### Consequences
 
-- Inherit a maintained truth source, real taskbar embedding, self-update mechanism, and 9-language i18n — for the cost of one daily upstream-sync workflow.
+- Inherit a maintained truth source, real taskbar embedding, self-update mechanism, and 8-language i18n — for the cost of one daily upstream-sync workflow.
 - Predictor logic must be re-homed in a sidecar; cannot run in-process with the upstream Rust binary.
 - Must keep edits to upstream files small and sentinel-marked so future upstream merges don't conflict.
 - Lose the predecessor's WPF dashboard window; replace with a Win32 GDI hover popup in Phase 4.
@@ -115,7 +115,7 @@ Empirically, `gnullvm` + `winget install MartinStorsjo.LLVM-MinGW.UCRT` produces
 
 - Local iteration loop is `cargo check`–level for the Rust side: typing, errors, lint pass — fast. To actually exercise the host binary requires a CI round-trip (~3 min).
 - The C# predictor is unaffected — local `dotnet publish` produces a fully runnable predictor exe.
-- If MSVC Build Tools ever become installable on this machine (e.g., IT policy change), this ADR is superseded: drop the `[target.x86_64-pc-windows-gnullvm]` overrides, remove `tools/dev-build.ps1`, switch the project's `rustup override` back to `stable-x86_64-pc-windows-msvc`. Net delta is small.
+- If MSVC Build Tools ever become installable on this machine (e.g., IT policy change), this ADR is superseded: run `rustup override unset` in the repo directory to drop back to the default `stable-x86_64-pc-windows-msvc` toolchain, remove `tools/dev-build.ps1`, and delete or empty `.cargo/config.toml` (currently only holds the `WINRES_TOOLCHAIN` env var for the LLVM-MinGW path). Net delta is small.
 - New contributors on machines with MSVC available **should not** use the gnullvm path — `cargo build --release` will just work via the default msvc toolchain.
 
 ---
