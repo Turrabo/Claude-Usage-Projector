@@ -1,0 +1,162 @@
+# Architectural decisions
+
+> Durable record of significant decisions for **Claude-Usage-Projector**. New decisions append at the bottom; existing entries are not edited except to add a "**Status**" line if they're later superseded. Format borrows from Michael Nygard's ADR template, deliberately terse.
+
+---
+
+## ADR-001: Fork CodeZeno upstream rather than rewrite the predecessor
+
+**Date:** 2026-05-13
+**Status:** Accepted
+
+### Context
+
+The predecessor project (Claude Session Monitor, WinUI 3/WPF + .NET 9) had a working predictor and JSONL telemetry adapter but a brittle truth source (WebView2 scraping of `claude.ai/settings/usage`), tray-icon-only UI, and a runtime dependency on the .NET 9 desktop runtime that some intended users couldn't install. CodeZeno's open-source [Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor) already solved the truth-source problem (authenticated OAuth API at `api.anthropic.com/api/oauth/usage`) and shipped a real native-Windows taskbar widget with zero install footprint.
+
+### Decision
+
+Fork CodeZeno's repo as the new baseline. Port the predecessor's predictor logic into a separate sidecar process attached to it. Freeze the predecessor as a read-only archive on the developer's machine.
+
+### Consequences
+
+- Inherit a maintained truth source, real taskbar embedding, self-update mechanism, and 9-language i18n — for the cost of one daily upstream-sync workflow.
+- Predictor logic must be re-homed in a sidecar; cannot run in-process with the upstream Rust binary.
+- Must keep edits to upstream files small and sentinel-marked so future upstream merges don't conflict.
+- Lose the predecessor's WPF dashboard window; replace with a Win32 GDI hover popup in Phase 4.
+
+---
+
+## ADR-002: Predictor sidecar process model rather than embedded library
+
+**Date:** 2026-05-13
+**Status:** Accepted
+
+### Context
+
+The predictor is C# (existing CSM code, well-tested). The host is Rust (CodeZeno's). Two paths to combine them: (a) compile the C# predictor as a native library and call it from Rust via FFI; (b) run the predictor as a separate process and communicate via stdin/stdout. FFI between .NET-AOT C# and Rust is supported but adds binding complexity and ABI fragility; the two-process model is well-understood and trivially testable.
+
+### Decision
+
+The predictor is a separate `.exe` co-located with the host, spawned at host startup, communicating via line-delimited JSON over the predictor's stdin/stdout. Versioned envelope (`{"v":1,"type":...}`) so the protocol can evolve.
+
+### Consequences
+
+- Build the predictor independently of the host; CI workflows are independent.
+- Two binaries to ship instead of one — packaging step in Phase 6 will bundle them.
+- Process crash isolation: predictor crash doesn't take down the widget, and vice versa.
+- Slightly higher RAM cost than in-process (additional process overhead, ~15-20 MB for the predictor at idle).
+- IPC backpressure / lifecycle handled by the sidecar wrapper in `src/csm/sidecar.rs`, not pushed onto callers.
+
+---
+
+## ADR-003: Self-contained single-file publish for the predictor, not NativeAOT
+
+**Date:** 2026-05-13
+**Status:** Accepted
+
+### Context
+
+The original plan was NativeAOT for the predictor — a small (~25 MB), fast-start native binary. NativeAOT publish on Windows requires the MSVC C++ linker (`link.exe`) from Visual Studio Build Tools. On the developer's corporate machine, five separate install attempts of `Microsoft.VisualStudio.2022.BuildTools` with the C++ workload all failed silently after downloading peripheral packages but before installing the `Microsoft.VC.Tools.*` workload payload. Most plausible cause: corporate IT policy blocks the MSVC payload from the Microsoft CDN while allowing the bootstrapper itself to run. Recovery via `InstallCleanup.exe -f` worked but subsequent installs failed identically.
+
+### Decision
+
+Publish the predictor as `dotnet publish -c Release -r win-x64 --self-contained true /p:PublishSingleFile=true /p:EnableCompressionInSingleFile=true`. Produces a ~35 MB exe with the .NET 9 runtime embedded — no install requirement for end users, no MSVC dependency for the developer.
+
+### Consequences
+
+- Predictor binary is ~35 MB instead of the ~25 MB NativeAOT estimate. Acceptable; both are well below the inflection point where users care.
+- Slightly slower startup than AOT (~50–200 ms cold-start). Acceptable for a long-running sidecar.
+- All AOT discipline (source-generated JSON serializer contexts, no reflection-based DI) was retained anyway, so a future migration to AOT is a one-line csproj change once MSVC becomes available.
+- Removes a hard dependency on Microsoft Build Tools from this project's developer setup. Anyone with the .NET 9 SDK can build it.
+
+---
+
+## ADR-004: JSONL append-only files for predictor storage, not SQLite
+
+**Date:** 2026-05-13
+**Status:** Accepted
+
+### Context
+
+The predecessor used SQLite (Microsoft.Data.Sqlite + Dapper) for signal history, prediction history, and Hawkes state. SQLite is full-featured but adds a native dependency (`e_sqlite3.dll`), complicates AOT/self-contained publish, and is overkill for what the predictor actually needs — append-only time-series with periodic state snapshots.
+
+### Decision
+
+Store observations and Claude Code events as append-only JSONL files; store Hawkes parameters + last prediction as a single `state.json` atomically replaced via temp-file rename. Located in `%APPDATA%\Claude-Code-Usage-Monitor\predictor\`. Rotation at 30 MB or weekly, whichever first.
+
+### Consequences
+
+- Zero native dependencies; AOT-friendly if we revisit ADR-003.
+- Trivially inspectable with `tail` / Notepad / any JSON tool.
+- No transactional guarantees across multiple files — accepted because the predictor is single-writer and tolerates losing the last few seconds of observations on a crash.
+- One-time migration tool (Phase 5) extracts useful CSM SQLite tables into JSONL — easier than supporting both formats.
+- Query patterns the predecessor relied on (e.g., "all predictions in the last 24h with HawkesIntensityRatio > 1.5") become line-by-line file walks — fast enough at expected data volumes (~minutes of usage * one row per poll = thousands of rows / week).
+
+---
+
+## ADR-005: GNU/gnullvm + LLVM-MinGW for local Rust builds; CI MSVC for runnable binaries
+
+**Date:** 2026-05-13
+**Status:** Accepted
+
+### Context
+
+The developer's machine cannot install MSVC C++ Build Tools (see ADR-003 for the corporate-block evidence). Rust's default Windows target (`x86_64-pc-windows-msvc`) needs `link.exe`. Rust's `x86_64-pc-windows-gnu` target uses GCC/binutils via rustup's bundled mingw — but rustup's bundled mingw is incomplete (missing `dlltool` deps, no `windres` for `winres` build-deps). Rust also offers `x86_64-pc-windows-gnullvm` which uses LLVM's `lld` + compiler-rt + libunwind, paired with an external LLVM-MinGW distribution.
+
+Empirically, `gnullvm` + `winget install MartinStorsjo.LLVM-MinGW.UCRT` produces a binary that **compiles successfully** but **silently exits during the message loop** after the "tray event hook installed" diagnose line. The MSVC-built binary from CI (where `windows-latest` runners have full MSVC pre-installed) runs identically to upstream. Likely cause of the gnullvm runtime exit: an ABI mismatch in Win32 callback dispatch through statically linked `libunwind` from compiler-rt. Not pursued because the CI MSVC path solves it without further work.
+
+### Decision
+
+- **Local**: gnullvm + LLVM-MinGW via `tools/dev-build.ps1` and `.cargo/config.toml`. Treat as **compile-check only** — the resulting binary is not runnable.
+- **Runnable binaries**: GitHub Actions `build-host` workflow on `windows-latest`. Push a branch, download the artifact.
+- Document this constraint clearly so a future Claude session doesn't waste a day re-debugging the runtime exit.
+
+### Consequences
+
+- Local iteration loop is `cargo check`–level for the Rust side: typing, errors, lint pass — fast. To actually exercise the host binary requires a CI round-trip (~3 min).
+- The C# predictor is unaffected — local `dotnet publish` produces a fully runnable predictor exe.
+- If MSVC Build Tools ever become installable on this machine (e.g., IT policy change), this ADR is superseded: drop the `[target.x86_64-pc-windows-gnullvm]` overrides, remove `tools/dev-build.ps1`, switch the project's `rustup override` back to `stable-x86_64-pc-windows-msvc`. Net delta is small.
+- New contributors on machines with MSVC available **should not** use the gnullvm path — `cargo build --release` will just work via the default msvc toolchain.
+
+---
+
+## ADR-006: Hover popup window for the predictor UI, not embedded in the taskbar widget
+
+**Date:** 2026-05-13
+**Status:** Accepted
+
+### Context
+
+CodeZeno's widget is a small embedded child of `Shell_TrayWnd` (~210 × 46 px) showing two horizontal bars and percentages. Adding the predictor's projection chart could either (a) extend the widget itself, (b) live in a separate popout window triggered on hover, or (c) live in a separate popout window triggered on right-click. (a) would conflict with every upstream layout change; (c) would be a click-to-open model with worse latency.
+
+### Decision
+
+Add a separate borderless `WS_EX_NOACTIVATE` popup window that appears after 200 ms of continuous mouse-hover over the widget and dismisses on mouse-leave with a 100 ms grace period. The popup is ~480 × 320 px, painted with raw GDI (Win32), and lives entirely in fork-authored code (`src/csm/popup.rs`, planned Phase 4).
+
+### Consequences
+
+- Zero conflict surface with upstream widget layout: the popup is a separate HWND that upstream's code doesn't know about.
+- Implementation involves Win32 message handling (`TrackMouseEvent`, `WM_MOUSEHOVER`, `WM_MOUSELEAVE`) — slightly more complex than a click handler, but well-trodden Win32 territory.
+- Performance: 5-second repaint cadence while shown; ignored when hidden. Negligible.
+
+---
+
+## ADR-007: Daily upstream-sync GitHub Action that fails on conflict
+
+**Date:** 2026-05-13
+**Status:** Accepted
+
+### Context
+
+The fork tracks an actively-maintained upstream (multiple releases per month). Manual `git fetch upstream && git merge` is easy to forget; bundled merges accumulate conflict surface area.
+
+### Decision
+
+A cron-scheduled GitHub Actions workflow (`.github/workflows/upstream-sync.yml`) runs daily at 13:17 UTC, fetches upstream, attempts a fast-forward merge into our `main`, and pushes if clean. On conflict, the workflow fails visibly (red X on the Actions tab) so the developer can resolve manually from a local clone.
+
+### Consequences
+
+- Clean upstream changes propagate automatically; no developer action required.
+- Conflicting upstream changes surface immediately, not weeks later when the conflict is bigger.
+- Workflow runs on `ubuntu-latest` (no build, just git operations) — essentially free CI minutes.
+- The sentinel-comment discipline (CSM EXTENSIONS BEGIN/END) is what keeps conflicts rare. Adding new touch points to upstream files raises this ADR's maintenance cost; prefer additive new files when possible.
