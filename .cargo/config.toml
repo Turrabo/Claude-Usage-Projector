@@ -1,0 +1,10 @@
+# Local cargo config — applies only when building for the gnullvm target.
+# CI builds on `windows-latest` use the msvc target by default; this block is
+# inert there.
+#
+# Setting the windres path lets the `winres` build dep find LLVM-MinGW's
+# resource compiler without us having to keep LLVM-MinGW on PATH in every
+# shell. Override via env if your install path differs.
+
+[env]
+WINRES_TOOLCHAIN = { value = "C:\\Users\\adamh\\AppData\\Local\\Microsoft\\WinGet\\Packages\\MartinStorsjo.LLVM-MinGW.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\\llvm-mingw-20260505-ucrt-x86_64", relative = false }
