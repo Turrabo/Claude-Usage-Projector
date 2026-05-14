@@ -114,7 +114,9 @@ fn spawn() -> Result<Sidecar, String> {
         .take()
         .ok_or_else(|| "predictor stdout pipe missing".to_string())?;
 
-    // Reader: parses each line as a log message; falls back to a raw forward.
+    // Reader: dispatches each line by the "type" field. Prediction messages
+    // are formatted as a single diagnose line for Phase 2; the popup window
+    // (Phase 4) will subscribe to a richer channel.
     thread::spawn(move || {
         let reader = BufReader::new(stdout);
         for line in reader.lines() {
@@ -122,9 +124,24 @@ fn spawn() -> Result<Sidecar, String> {
             if line.is_empty() {
                 continue;
             }
-            match serde_json::from_str::<crate::csm::ipc::LogMessage>(&line) {
-                Ok(log) => diagnose::log(format!("predictor[{}] {}", log.level, log.msg)),
-                Err(_) => diagnose::log(format!("predictor(raw) {line}")),
+            match classify_message(&line) {
+                Some("prediction") => {
+                    match serde_json::from_str::<crate::csm::ipc::PredictionMessage>(&line) {
+                        Ok(pred) => diagnose::log(format_prediction(&pred)),
+                        Err(err) => diagnose::log(format!(
+                            "predictor(prediction parse failed) {err}: {line}"
+                        )),
+                    }
+                }
+                Some("log") | None => {
+                    match serde_json::from_str::<crate::csm::ipc::LogMessage>(&line) {
+                        Ok(log) => diagnose::log(format!("predictor[{}] {}", log.level, log.msg)),
+                        Err(_) => diagnose::log(format!("predictor(raw) {line}")),
+                    }
+                }
+                Some(other) => {
+                    diagnose::log(format!("predictor(unhandled type={other}) {line}"));
+                }
             }
         }
         diagnose::log("csm: predictor stdout reader ended");
@@ -152,6 +169,51 @@ fn spawn_writer(mut stdin: ChildStdin, rx: mpsc::Receiver<String>) {
         }
         diagnose::log("csm: predictor stdin writer ended");
     });
+}
+
+fn classify_message(line: &str) -> Option<&str> {
+    // Cheap discriminator without allocating: scan once for `"type":"..."`. We
+    // avoid a full JSON parse on every line because the writer thread already
+    // pays for the line decode below, and this lets us bail out early on
+    // malformed lines.
+    let key = "\"type\":\"";
+    let start = line.find(key)? + key.len();
+    let rest = &line[start..];
+    let end = rest.find('"')?;
+    Some(&rest[..end])
+}
+
+fn format_prediction(p: &crate::csm::ipc::PredictionMessage) -> String {
+    let pct = p
+        .used_pct
+        .map(|v| format!("{v:.1}%"))
+        .unwrap_or_else(|| "?".to_string());
+    let rate = p
+        .rate_per_min
+        .map(|v| format!("{v:.3}/min"))
+        .unwrap_or_else(|| "?/min".to_string());
+    let p50 = p
+        .projected_empty_p50
+        .as_deref()
+        .unwrap_or("none");
+    let prob = p.prob_empty_before_refresh.unwrap_or(0.0);
+    let stale = p.stale.unwrap_or(false);
+    let reason = p.reason.as_deref().unwrap_or("");
+    format!(
+        "predictor[pred] tier={} risk={} used={} rate={} p50={} pE={:.2} stale={}{}",
+        p.tier,
+        p.risk,
+        pct,
+        rate,
+        p50,
+        prob,
+        stale,
+        if reason.is_empty() {
+            String::new()
+        } else {
+            format!(" — {reason}")
+        }
+    )
 }
 
 fn locate_predictor() -> Result<std::path::PathBuf, String> {

@@ -1,9 +1,10 @@
 # Rust build artifacts
 /target/
 
-# .NET predictor build artifacts (fork-specific)
-/predictor/bin/
-/predictor/obj/
+# .NET predictor build artifacts (fork-specific). Glob form so the sub-project
+# under predictor/Predictor.Tests/ is also covered.
+/predictor/**/bin/
+/predictor/**/obj/
 
 # Cargo lock (optional for binaries, included by default)
 # Cargo.lock

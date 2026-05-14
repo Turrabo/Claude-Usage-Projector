@@ -20,4 +20,18 @@
     <DebugType>embedded</DebugType>
   </PropertyGroup>
 
+  <ItemGroup>
+    <PackageReference Include="MathNet.Numerics" Version="5.0.0" />
+  </ItemGroup>
+
+  <!-- The SDK default *.cs glob would otherwise pull the sibling Tests project
+       into this exe's compile list. Excluding it here keeps Predictor.Tests/
+       owned exclusively by its own csproj. -->
+  <ItemGroup>
+    <Compile Remove="Predictor.Tests/**" />
+    <None Remove="Predictor.Tests/**" />
+    <Content Remove="Predictor.Tests/**" />
+    <EmbeddedResource Remove="Predictor.Tests/**" />
+  </ItemGroup>
+
 </Project>
