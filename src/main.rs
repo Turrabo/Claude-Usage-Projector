@@ -10,6 +10,10 @@ mod tray_icon;
 mod updater;
 mod window;
 
+// === CSM EXTENSIONS BEGIN ===
+mod csm;
+// === CSM EXTENSIONS END ===
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let diagnose_enabled = args.iter().any(|arg| arg == "--diagnose");
@@ -36,5 +40,14 @@ fn main() {
     if diagnose_enabled {
         diagnose::log("entering window::run");
     }
+
+    // === CSM EXTENSIONS BEGIN ===
+    csm::sidecar::init();
+    // === CSM EXTENSIONS END ===
+
     window::run();
+
+    // === CSM EXTENSIONS BEGIN ===
+    csm::sidecar::shutdown();
+    // === CSM EXTENSIONS END ===
 }

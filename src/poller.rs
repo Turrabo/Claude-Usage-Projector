@@ -90,6 +90,9 @@ pub fn poll(show_claude_code: bool, show_codex: bool) -> Result<AppUsageData, Po
     if data.claude_code.is_none() && data.codex.is_none() {
         Err(PollError::RequestFailed)
     } else {
+        // === CSM EXTENSIONS BEGIN ===
+        crate::csm::sidecar::record_observation(&data);
+        // === CSM EXTENSIONS END ===
         Ok(data)
     }
 }

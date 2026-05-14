@@ -1,48 +1,91 @@
 using System.Text.Json;
+using ClaudeUsageProjector.Predictor.Ipc;
 
-// ccum-predictor v0.0.1 — Phase 0 skeleton
+// ccum-predictor — Phase 1 IPC scaffold.
 //
-// IPC contract (line-delimited JSON over stdin/stdout):
-//   Host -> Predictor:  {"v":1,"type":"observe", ...}
-//                       {"v":1,"type":"shutdown"}
-//   Predictor -> Host:  {"v":1,"type":"log","level":"info","msg":"..."}
-//                       (future: prediction, chart_data)
+// Reads line-delimited JSON messages from stdin. Each line should be one of:
+//   {"v":1,"type":"observe","t":"...","cc":{...},"cx":null}
+//   {"v":1,"type":"shutdown"}
 //
-// stdout is reserved for protocol messages. stderr is for unstructured
-// diagnostic output the host may forward to its log file.
+// For now we acknowledge each observation with a log line and exit cleanly
+// on shutdown. Phases 2+ will replace the acknowledgements with real
+// prediction emissions (tier/risk/projection) ported from CSM.
 
-Console.Error.WriteLine($"ccum-predictor v0.0.1 starting (pid={Environment.ProcessId})");
+Log("info", $"ccum-predictor v0.1.0 started (pid={Environment.ProcessId})");
 
 string? line;
 while ((line = Console.In.ReadLine()) is not null)
 {
-    // Phase 0 behaviour: echo every incoming line back as a log message.
-    var echo = JsonSerializer.Serialize(new
-    {
-        v = 1,
-        type = "log",
-        level = "info",
-        msg = $"echo: {line}"
-    });
-    Console.Out.WriteLine(echo);
-    Console.Out.Flush();
+    if (string.IsNullOrWhiteSpace(line)) continue;
 
-    // Recognise shutdown so the host can drain cleanly.
+    string messageType;
+    JsonDocument? doc;
     try
     {
-        using var doc = JsonDocument.Parse(line);
-        if (doc.RootElement.TryGetProperty("type", out var t)
-            && t.ValueKind == JsonValueKind.String
-            && t.GetString() == "shutdown")
-        {
-            Console.Error.WriteLine("ccum-predictor: shutdown received");
-            return;
-        }
+        doc = JsonDocument.Parse(line);
+        messageType = doc.RootElement.TryGetProperty("type", out var t) && t.ValueKind == JsonValueKind.String
+            ? t.GetString()!
+            : "(missing-type)";
     }
-    catch (JsonException)
+    catch (JsonException ex)
     {
-        // Not JSON. Phase 0 tolerates this; phase 1+ will be stricter.
+        Log("warn", $"unparseable input: {ex.Message}");
+        continue;
+    }
+
+    using (doc)
+    {
+        switch (messageType)
+        {
+            case "observe":
+                HandleObserve(line);
+                break;
+            case "shutdown":
+                Log("info", "shutdown received");
+                return;
+            default:
+                Log("warn", $"unknown message type: {messageType}");
+                break;
+        }
     }
 }
 
-Console.Error.WriteLine("ccum-predictor: stdin closed, exiting");
+Log("info", "stdin closed; exiting");
+return;
+
+
+static void HandleObserve(string rawLine)
+{
+    ObserveMessage? observe;
+    try
+    {
+        observe = JsonSerializer.Deserialize(rawLine, IpcJsonContext.Default.ObserveMessage);
+    }
+    catch (JsonException ex)
+    {
+        Log("warn", $"observe parse failed: {ex.Message}");
+        return;
+    }
+
+    if (observe is null)
+    {
+        Log("warn", "observe deserialised to null");
+        return;
+    }
+
+    var cc = observe.ClaudeCode is null
+        ? "cc=none"
+        : $"cc 5h={observe.ClaudeCode.FiveHourPct:0.0}% 7d={observe.ClaudeCode.SevenDayPct:0.0}%";
+    var cx = observe.Codex is null
+        ? "cx=none"
+        : $"cx 5h={observe.Codex.FiveHourPct:0.0}% 7d={observe.Codex.SevenDayPct:0.0}%";
+
+    Log("info", $"observed @ {observe.TimestampUtc}  {cc}  {cx}");
+}
+
+static void Log(string level, string msg)
+{
+    var line = JsonSerializer.Serialize(new LogMessage { Level = level, Msg = msg }, IpcJsonContext.Default.LogMessage);
+    Console.Out.WriteLine(line);
+    Console.Out.Flush();
+}
