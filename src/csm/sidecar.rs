@@ -208,10 +208,12 @@ fn format_prediction(p: &crate::csm::ipc::PredictionMessage) -> String {
         p50,
         prob,
         stale,
+        // ASCII separator only — the diagnose log file is read by viewers that
+        // interpret it as Windows-1252, which would otherwise mangle UTF-8.
         if reason.is_empty() {
             String::new()
         } else {
-            format!(" — {reason}")
+            format!(" -- {reason}")
         }
     )
 }
