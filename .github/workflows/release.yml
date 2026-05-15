@@ -1,77 +1,123 @@
-name: Release
+# Fork-specific release workflow. Replaces upstream's release.yml (which
+# submits to CodeZeno's WinGet package) — we don't publish via WinGet; we
+# bundle both binaries into a single zip and attach it to a GitHub Release.
+#
+# Trigger: push a tag matching v* (e.g. `git tag v0.5.0 && git push origin
+# v0.5.0`). The existing build-host / build-predictor workflows still fire
+# on every non-main push for dev iteration; this one is opt-in via tags.
+#
+# See docs/RELEASING.md for the cadence and the manual-fallback path.
+
+name: release
 
 on:
   push:
     tags:
-      - "v*"
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to (re)release, e.g. v0.5.0'
+        required: true
+        type: string
 
 permissions:
   contents: write
 
-env:
-  RELEASE_ASSET_NAME: claude-code-usage-monitor.exe
-  WINGET_PACKAGE_ID: CodeZeno.ClaudeCodeUsageMonitor
-
 jobs:
-  build:
+  build-and-release:
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+
+      - name: Resolve tag name
+        id: tag
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $tag = "${{ inputs.tag }}"
+          } else {
+            $tag = "${{ github.ref_name }}"
+          }
+          if (-not $tag.StartsWith("v")) { throw "expected tag like v0.5.0, got '$tag'" }
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Releasing tag: $tag"
+
+      - uses: actions/setup-dotnet@v4
         with:
-          fetch-depth: 0
+          dotnet-version: '9.0.x'
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Show toolchain
+        run: |
+          rustc --version
+          cargo --version
+          dotnet --version
 
-      - name: Build release binary
+      - name: cargo build --release (host)
         run: cargo build --release
+
+      - name: dotnet restore (predictor)
+        working-directory: predictor
+        run: dotnet restore predictor.sln
+
+      - name: dotnet test (predictor)
+        working-directory: predictor
+        run: dotnet test predictor.sln -c Release --no-restore --logger "console;verbosity=minimal"
+
+      - name: dotnet publish (predictor single-file)
+        working-directory: predictor
+        run: dotnet publish Predictor.csproj -c Release -r win-x64 --self-contained true /p:PublishSingleFile=true --no-restore
+
+      - name: Assemble release bundle
+        id: bundle
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.tag.outputs.tag }}"
+          $stage = "release-stage"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item target/release/claude-code-usage-monitor.exe $stage/
+          Copy-Item predictor/bin/Release/net9.0/win-x64/publish/ccum-predictor.exe $stage/
+
+          @"
+          Claude-Usage-Projector $tag
+          ----------------------------
+
+          A Windows taskbar widget showing live Claude usage with a
+          hover-popup chart for the current session's projection.
+
+          Quick start
+          -----------
+          1. Extract both .exe files into the same folder.
+          2. Right-click each .exe -> Properties -> Unblock (Mark of the Web).
+          3. Double-click claude-code-usage-monitor.exe.
+          4. The widget appears in the system taskbar next to the system tray.
+
+          The first launch may show a "Windows protected your PC" warning.
+          Click "More info" -> "Run anyway". The binaries are unsigned.
+
+          Two binaries must stay co-located:
+            - claude-code-usage-monitor.exe (the widget itself)
+            - ccum-predictor.exe (the prediction sidecar)
+
+          Diagnose log: %TEMP%\claude-code-usage-monitor.log (if launched
+          with --diagnose).
+
+          Source: https://github.com/Turrabo/Claude-Usage-Projector
+          "@ | Out-File -FilePath "$stage/README.txt" -Encoding utf8
+
+          $zipName = "ccum-windows-x64-$tag.zip"
+          Compress-Archive -Path "$stage/*" -DestinationPath $zipName -Force
+          Get-ChildItem $zipName | Select-Object Name, @{Name='SizeMB'; Expression={[math]::Round($_.Length/1MB,2)}}
+
+          "zip=$zipName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: target/release/claude-code-usage-monitor.exe
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          files: ${{ steps.bundle.outputs.zip }}
           generate_release_notes: true
-
-  winget:
-    needs: build
-    runs-on: windows-latest
-    env:
-      WINGETCREATE_GITHUB_TOKEN: ${{ secrets.WINGETCREATE_GITHUB_TOKEN }}
-    steps:
-      - name: Prepare release metadata
-        shell: pwsh
-        run: |
-          $tag = "${{ github.ref_name }}"
-          $version = $tag.TrimStart('v')
-          $packageUrl = "https://github.com/${{ github.repository }}/releases/download/$tag/${{ env.RELEASE_ASSET_NAME }}"
-
-          "PACKAGE_VERSION=$version" >> $env:GITHUB_ENV
-          "PACKAGE_URL=$packageUrl" >> $env:GITHUB_ENV
-
-      - name: Skip when winget token is not configured
-        if: env.WINGETCREATE_GITHUB_TOKEN == ''
-        shell: pwsh
-        run: |
-          Write-Warning "Skipping WinGet submission because WINGETCREATE_GITHUB_TOKEN is not configured."
-
-      - name: Install .NET 6 runtime
-        if: env.WINGETCREATE_GITHUB_TOKEN != ''
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: "6.0.x"
-
-      - name: Download wingetcreate
-        if: env.WINGETCREATE_GITHUB_TOKEN != ''
-        shell: pwsh
-        run: |
-          Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
-
-      - name: Submit WinGet manifest update
-        if: env.WINGETCREATE_GITHUB_TOKEN != ''
-        shell: pwsh
-        run: |
-          .\wingetcreate.exe update `
-            --submit `
-            --token $env:WINGETCREATE_GITHUB_TOKEN `
-            --urls $env:PACKAGE_URL `
-            --version $env:PACKAGE_VERSION `
-            $env:WINGET_PACKAGE_ID
+          draft: false
+          prerelease: false

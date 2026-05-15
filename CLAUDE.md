@@ -33,6 +33,7 @@ The fork is designed to absorb upstream changes with minimal conflict:
 - **All fork-authored code lives in new files**: `predictor/`, `src/csm/`, `tools/`, `docs/`, top-level docs
 - **Edits to upstream files are kept tiny and sentinel-marked** (`// === CSM EXTENSIONS BEGIN ===` / `// === CSM EXTENSIONS END ===`) — currently four sites: `src/main.rs` (module decl; sidecar/popup/hover init; sidecar/popup/hover shutdown — three sentinel blocks) and `src/poller.rs` (one-line observation hook)
 - **Upstream's `README.md` and `LICENSE` are not modified** — keep them as-is for clean fast-forwards from upstream
+- **One upstream file is fully replaced**: `.github/workflows/release.yml`. Upstream's submits to their WinGet package; ours bundles both binaries into a zip Release. Future upstream changes to that file will surface as a merge conflict, which is the intended divergence signal.
 
 A daily GitHub Actions workflow (`.github/workflows/upstream-sync.yml`) attempts a fast-forward merge from upstream; conflicts surface as failed runs for manual resolution.
 
@@ -57,7 +58,7 @@ If you are reading this on a machine where MSVC **is** available, the simpler pa
 | 3 | ✅ shipped | Port **JSONL tail adapter** and **Tier 3 Hawkes** burst model; predictions become rhythm-aware |
 | 4 | ✅ shipped | **Hover popup window** with chart and risk-coloured projection (Win32 GDI, hover-poll-driven over the widget) |
 | 5 | ✅ shipped | **JSONL persistence + one-time CSM SQLite migration**: predictor writes every observation to history.jsonl, imports the predecessor's csm.sqlite truth-source rows on first run |
-| 6 | pending | Polish for colleague distribution: first-run UX, error states, code-signed release |
+| 6 | pending | Distribution polish: tag-triggered release packaging (zip on GitHub Releases) and verified-graceful first-launch paths. **Code-signing is explicitly out of scope** — releases are unsigned; SmartScreen "More info → Run anyway" is accepted. |
 
 Completed phases live in `git log` and `DECISIONS.md`. Forward direction lives here. Do not retro-edit this table to add notes about completed work — those belong in commit messages and `DECISIONS.md`.
 
