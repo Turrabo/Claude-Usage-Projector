@@ -1,6 +1,8 @@
 // Hover popup window for the predictor. Borderless top-level Win32 window
 // that materialises on continuous mouse hover over the widget (see hover.rs)
-// and renders the latest PredictionMessage plus a recent history graph.
+// and renders the current session's usage trend with a single risk-coloured
+// projection line. Visual design ported from the predecessor CSM's
+// ChartPopover (450x160, chart-only, no header or footer text).
 //
 // Architecture:
 //   - The popup lives on its own dedicated thread with its own message loop,
@@ -8,9 +10,8 @@
 //     all routed via PostMessageW so callers from any thread are safe.
 //   - All Win32 calls touching the popup HWND happen on the popup thread.
 //     The shared HWND handle is stored as an `isize` static so it's Send.
-//   - Painting is raw GDI. Single-buffered for simplicity; the 5-second
-//     repaint cadence and the ShowWindow-no-flicker properties of NOACTIVATE
-//     means we don't need a memory DC swap at this point.
+//   - Painting is raw GDI. Single-buffered: the 5-second repaint cadence
+//     and ShowWindow-no-flicker properties are enough at this size.
 //
 // ADR-006 records the design rationale for picking a separate HWND over an
 // embedded widget extension.
@@ -30,8 +31,8 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::csm::prediction_store::{store, HistoryEntry, LatestPrediction};
 use crate::diagnose;
 
-pub const POPUP_WIDTH: i32 = 480;
-pub const POPUP_HEIGHT: i32 = 320;
+pub const POPUP_WIDTH: i32 = 450;
+pub const POPUP_HEIGHT: i32 = 160;
 
 const POPUP_CLASS_NAME: &str = "ClaudeUsageProjectorPopup";
 
@@ -133,7 +134,7 @@ fn popup_thread() {
             hInstance: hinstance,
             hIcon: HICON::default(),
             hCursor: LoadCursorW(HINSTANCE::default(), IDC_ARROW).unwrap_or_default(),
-            hbrBackground: HBRUSH((COLOR_3DFACE.0 + 1) as *mut _),
+            hbrBackground: HBRUSH::default(),
             lpszMenuName: PCWSTR::null(),
             lpszClassName: PCWSTR::from_raw(class_name.as_ptr()),
             hIconSm: HICON::default(),
@@ -240,8 +241,8 @@ unsafe extern "system" fn popup_wnd_proc(
     }
 }
 
-/// Compute the popup's top-left so it sits above-and-to-the-left of the
-/// anchor (typical: cursor or widget centre), clamped to the work-area edges.
+/// Compute the popup's top-left so it sits above the anchor (typical: widget
+/// centre-top), clamped to the work-area edges.
 fn position_relative_to(anchor_x: i32, anchor_y: i32) -> (i32, i32) {
     unsafe {
         let mut wa = RECT::default();
@@ -259,8 +260,10 @@ fn position_relative_to(anchor_x: i32, anchor_y: i32) -> (i32, i32) {
             (0, 0, 1920, 1080)
         };
 
-        let preferred_x = anchor_x - POPUP_WIDTH + 16; // slightly overlapping the widget
-        let preferred_y = anchor_y - POPUP_HEIGHT - 8; // above the taskbar
+        // CSM behaviour: align left edge with the widget; place above with a
+        // small gap; clamp to work area.
+        let preferred_x = anchor_x - POPUP_WIDTH / 2;
+        let preferred_y = anchor_y - POPUP_HEIGHT - 6;
         let x = preferred_x.clamp(min_x, max_x - POPUP_WIDTH);
         let y = preferred_y.clamp(min_y, max_y - POPUP_HEIGHT);
         (x, y)
@@ -269,319 +272,321 @@ fn position_relative_to(anchor_x: i32, anchor_y: i32) -> (i32, i32) {
 
 // ---------------- Painting ----------------
 
-const MARGIN: i32 = 12;
-const HEADER_H: i32 = 36;
-const FOOTER_H: i32 = 84;
+// All sizes in client-area pixels.
+const PAD_L: i32 = 32;
+const PAD_R: i32 = 10;
+const PAD_T: i32 = 10;
+const PAD_B: i32 = 22;
 
-const COLOR_BG: COLORREF = COLORREF(0x202020); // dark slate
-const COLOR_FG: COLORREF = COLORREF(0xEEEEEE);
-const COLOR_MUTED: COLORREF = COLORREF(0x9A9A9A);
-const COLOR_AXIS: COLORREF = COLORREF(0x444444);
-const COLOR_LINE: COLORREF = COLORREF(0xE0C040); // amber
-const COLOR_P50: COLORREF = COLORREF(0x60E060); // green
-const COLOR_P75: COLORREF = COLORREF(0xE0E060); // yellow
-const COLOR_P90: COLORREF = COLORREF(0x6080FF); // blue
-const COLOR_HAWKES: COLORREF = COLORREF(0xC080FF); // violet
+// COLORREF is 0x00BBGGRR. Define the CSM palette literally.
+const COLOR_BG: COLORREF = COLORREF(0x181818);
+const COLOR_GRID: COLORREF = COLORREF(0x333333);
+const COLOR_DIM: COLORREF = COLORREF(0x707070);
+const COLOR_NOW: COLORREF = COLORREF(0x555555);
+const COLOR_HISTORY: COLORREF = COLORREF(0xFF9F4C); // BGR for CSM #4C9FFF blue
+const COLOR_HINT: COLORREF = COLORREF(0x606060);
 
 fn risk_color(risk: &str) -> COLORREF {
+    // BGR encoding.
     match risk {
-        "high" => COLORREF(0x4040FF),  // red (BGR)
-        "medium" => COLORREF(0x40A0E0), // amber
-        "low" => COLORREF(0x40C040),   // green
-        _ => COLOR_MUTED,
+        "high" => COLORREF(0x4B4BE5),   // CSM #E54B4B red
+        "medium" => COLORREF(0x00B3FF), // CSM #FFB300 amber
+        _ => COLORREF(0x50AF4C),        // CSM #4CAF50 green
     }
 }
 
 unsafe fn paint(hdc: HDC) {
     let (latest, history) = store().snapshot();
 
-    let rect = RECT {
+    let full = RECT {
         left: 0,
         top: 0,
         right: POPUP_WIDTH,
         bottom: POPUP_HEIGHT,
     };
-    fill_solid(hdc, &rect, COLOR_BG);
+    fill_solid(hdc, &full, COLOR_BG);
 
     SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, COLOR_FG);
 
     let font = GetStockObject(DEFAULT_GUI_FONT);
     let old_font = SelectObject(hdc, font);
 
-    draw_header(hdc, &latest);
-    draw_chart(hdc, &latest, &history);
-    draw_footer(hdc, &latest, &history);
+    paint_chart(hdc, &latest, &history);
 
     SelectObject(hdc, old_font);
 }
 
-unsafe fn draw_header(hdc: HDC, latest: &Option<LatestPrediction>) {
-    let header_rect = RECT {
-        left: 0,
-        top: 0,
-        right: POPUP_WIDTH,
-        bottom: HEADER_H,
+unsafe fn paint_chart(
+    hdc: HDC,
+    latest: &Option<LatestPrediction>,
+    history: &[HistoryEntry],
+) {
+    let plot_left = PAD_L;
+    let plot_right = POPUP_WIDTH - PAD_R;
+    let plot_top = PAD_T;
+    let plot_bottom = POPUP_HEIGHT - PAD_B;
+    let plot_w = plot_right - plot_left;
+    let plot_h = plot_bottom - plot_top;
+
+    // Determine session window.
+    let now_unix = latest
+        .as_ref()
+        .map(|p| p.computed_unix)
+        .or_else(|| history.last().map(|h| h.computed_unix))
+        .unwrap_or(0);
+
+    let refresh_unix = latest.as_ref().and_then(|p| p.refresh_unix);
+
+    let truths: Vec<&HistoryEntry> = history
+        .iter()
+        .filter(|h| h.used_pct.is_some())
+        .collect();
+
+    let (session_start, session_end, known_session) = match refresh_unix {
+        Some(end) => (end - 5 * 3600, end, true),
+        None => {
+            if let Some(first) = truths.first() {
+                (first.computed_unix, now_unix.max(first.computed_unix + 60), false)
+            } else {
+                draw_hint(hdc, "no snapshots yet", plot_left + 4, plot_top + 4);
+                return;
+            }
+        }
     };
-    fill_solid(hdc, &header_rect, COLORREF(0x303030));
 
-    let Some(p) = latest else {
-        draw_text_left(
-            hdc,
-            "Waiting for first prediction...",
-            POPUP_WIDTH,
-            MARGIN,
-            10,
-            COLOR_MUTED,
-        );
-        return;
+    let t_range = (session_end - session_start).max(60) as f64;
+    let time_to_x = |t: i64| -> i32 {
+        let frac = ((t - session_start) as f64 / t_range).clamp(0.0, 1.0);
+        plot_left + (frac * plot_w as f64) as i32
+    };
+    let pct_to_y = |pct: f64| -> i32 {
+        let clamped = pct.clamp(0.0, 100.0);
+        plot_top + ((1.0 - clamped / 100.0) * plot_h as f64) as i32
     };
 
-    // Tier badge
-    let badge_w = 40;
-    let badge_rect = RECT {
-        left: MARGIN,
-        top: 8,
-        right: MARGIN + badge_w,
-        bottom: HEADER_H - 4,
-    };
-    fill_solid(hdc, &badge_rect, COLORREF(0x505050));
-    let tier_text = format!("T{}", p.tier);
-    draw_text_centered(hdc, &tier_text, &badge_rect, COLOR_FG);
-
-    // Risk pill
-    let risk_label = format!("RISK: {}", p.risk.to_uppercase());
-    let risk_rect = RECT {
-        left: MARGIN + badge_w + 8,
-        top: 8,
-        right: MARGIN + badge_w + 8 + 140,
-        bottom: HEADER_H - 4,
-    };
-    fill_solid(hdc, &risk_rect, risk_color(&p.risk));
-    draw_text_centered(hdc, &risk_label, &risk_rect, COLORREF(0x000000));
-
-    // Used %
-    let used = p
-        .used_pct
-        .map(|v| format!("used {v:.1}%"))
-        .unwrap_or_else(|| "used ?".to_string());
-    draw_text_left(
-        hdc,
-        &used,
-        POPUP_WIDTH,
-        MARGIN + badge_w + 8 + 140 + 12,
-        12,
-        COLOR_FG,
-    );
-
-    // Rate (right-aligned)
-    let rate = p
-        .rate_per_min
-        .map(|v| format!("{v:.3} %/min"))
-        .unwrap_or_else(|| "?/min".to_string());
-    draw_text_right(hdc, &rate, POPUP_WIDTH - MARGIN, 12, COLOR_MUTED);
-}
-
-unsafe fn draw_chart(hdc: HDC, latest: &Option<LatestPrediction>, history: &[HistoryEntry]) {
-    let chart_top = HEADER_H + 8;
-    let chart_bottom = POPUP_HEIGHT - FOOTER_H - 8;
-    let chart_left = MARGIN + 30; // leave room for y-axis labels
-    let chart_right = POPUP_WIDTH - MARGIN;
-    let chart_h = chart_bottom - chart_top;
-    let chart_w = chart_right - chart_left;
-
-    // y-axis: 0..100
-    let pen_axis = CreatePen(PS_SOLID, 1, COLOR_AXIS);
-    let old_pen = SelectObject(hdc, pen_axis);
-    line(hdc, chart_left, chart_top, chart_left, chart_bottom);
-    line(hdc, chart_left, chart_bottom, chart_right, chart_bottom);
-    // gridlines at 25/50/75/100
-    for tick in [25, 50, 75, 100] {
-        let y = chart_bottom - (tick * chart_h / 100);
-        line(hdc, chart_left, y, chart_right, y);
-        let label = format!("{tick}");
-        draw_text_right(hdc, &label, chart_left - 4, y - 7, COLOR_MUTED);
+    // Y gridlines + labels
+    let pen_grid = create_dashed_pen(COLOR_GRID, &[2, 4]);
+    let old_pen = SelectObject(hdc, pen_grid);
+    SetTextColor(hdc, COLOR_DIM);
+    for p in [0, 25, 50, 75, 100] {
+        let y = pct_to_y(p as f64);
+        line(hdc, plot_left, y, plot_right, y);
+        draw_text_left(hdc, &format!("{p}%"), plot_left - 4, 2, y - 7, COLOR_DIM);
     }
     SelectObject(hdc, old_pen);
-    let _ = DeleteObject(pen_axis);
+    let _ = DeleteObject(pen_grid);
 
-    // Plot used-pct history. X axis = last 90 minutes ending at "now-ish"
-    // (= last history entry's timestamp, or the latest prediction's).
-    let now_unix = latest.as_ref().map(|p| p.computed_unix).unwrap_or_else(|| {
-        history.last().map(|h| h.computed_unix).unwrap_or(0)
-    });
-    if now_unix == 0 || history.is_empty() {
-        draw_text_centered(
+    // "Now" dotted vertical marker
+    if now_unix > session_start && now_unix < session_end {
+        let nx = time_to_x(now_unix);
+        let pen_now = create_dashed_pen(COLOR_NOW, &[3, 4]);
+        let old_pen = SelectObject(hdc, pen_now);
+        line(hdc, nx, plot_top, nx, plot_bottom);
+        SelectObject(hdc, old_pen);
+        let _ = DeleteObject(pen_now);
+    }
+
+    // Historical polyline
+    let in_session: Vec<&HistoryEntry> = truths
+        .into_iter()
+        .filter(|h| h.computed_unix >= session_start)
+        .collect();
+
+    if in_session.is_empty() {
+        draw_hint(hdc, "no snapshots in this session yet", plot_left + 4, plot_top + 4);
+        draw_x_axis_labels(
             hdc,
-            "Collecting data...",
-            &RECT {
-                left: chart_left,
-                top: chart_top,
-                right: chart_right,
-                bottom: chart_bottom,
-            },
-            COLOR_MUTED,
+            session_start,
+            session_end,
+            now_unix,
+            known_session,
+            time_to_x,
+            plot_top,
+            plot_h,
+            plot_left,
+            plot_w,
         );
         return;
     }
 
-    let window_secs: i64 = 90 * 60;
-    let x_for = |t: i64| -> i32 {
-        let offset = (t - (now_unix - window_secs)) as f64 / window_secs as f64;
-        chart_left + (offset.clamp(0.0, 1.0) * chart_w as f64) as i32
-    };
-    let y_for = |pct: f64| -> i32 {
-        let clamped = pct.clamp(0.0, 100.0);
-        chart_bottom - (clamped / 100.0 * chart_h as f64) as i32
-    };
-
-    // history line
-    let points: Vec<(i32, i32)> = history
+    let points: Vec<(i32, i32)> = in_session
         .iter()
-        .filter_map(|h| h.used_pct.map(|p| (x_for(h.computed_unix), y_for(p))))
+        .filter_map(|h| h.used_pct.map(|p| (time_to_x(h.computed_unix), pct_to_y(p))))
         .collect();
     if points.len() >= 2 {
-        let pen_line = CreatePen(PS_SOLID, 2, COLOR_LINE);
+        let pen_line = CreatePen(PS_SOLID, 2, COLOR_HISTORY);
         let old_pen = SelectObject(hdc, pen_line);
         polyline(hdc, &points);
         SelectObject(hdc, old_pen);
         let _ = DeleteObject(pen_line);
     }
 
-    // Projection cone: line from latest observed point to each projected
-    // empty timestamp at y=100, in three colours.
+    let last = in_session.last().copied().unwrap();
+    let last_pct = last.used_pct.unwrap();
+    let last_x = time_to_x(last.computed_unix);
+    let last_y = pct_to_y(last_pct);
+
+    // Projection + run-out marker
     if let Some(p) = latest {
-        if let Some(used) = p.used_pct {
-            let origin = (x_for(p.computed_unix), y_for(used));
-            for (proj, color) in [
-                (p.projected_p50_unix, COLOR_P50),
-                (p.projected_p75_unix, COLOR_P75),
-                (p.projected_p90_unix, COLOR_P90),
-            ] {
-                if let Some(target_unix) = proj {
-                    let target = (x_for(target_unix), y_for(100.0));
-                    let pen = CreatePen(PS_DASH, 1, color);
+        if let Some(rate) = p.rate_per_min {
+            if rate > 0.0 {
+                let burn = rate;
+                let start_pct = last_pct;
+                let start_time = last.computed_unix;
+                let runs_out = p
+                    .projected_p50_unix
+                    .map(|t| t < session_end)
+                    .unwrap_or(false);
+
+                let (proj_end_time, proj_end_pct) = if runs_out {
+                    (p.projected_p50_unix.unwrap(), 100.0)
+                } else {
+                    let final_pct = (start_pct
+                        + burn * ((session_end - start_time) as f64 / 60.0))
+                        .min(100.0);
+                    (session_end, final_pct)
+                };
+
+                let risk = risk_color(&p.risk);
+                if proj_end_time > start_time {
+                    let proj_x = time_to_x(proj_end_time);
+                    let proj_y = pct_to_y(proj_end_pct);
+                    let pen = create_dashed_pen(risk, &[6, 3]);
                     let old_pen = SelectObject(hdc, pen);
-                    line(hdc, origin.0, origin.1, target.0, target.1);
+                    line(hdc, last_x, last_y, proj_x, proj_y);
                     SelectObject(hdc, old_pen);
                     let _ = DeleteObject(pen);
+
+                    if runs_out && proj_x > plot_left && proj_x < plot_right {
+                        let pen2 = create_dashed_pen(risk, &[4, 3]);
+                        let old_pen2 = SelectObject(hdc, pen2);
+                        line(hdc, proj_x, plot_top, proj_x, plot_bottom);
+                        SelectObject(hdc, old_pen2);
+                        let _ = DeleteObject(pen2);
+
+                        let warn = format!("! {}", short_local_time(proj_end_time));
+                        let label_x = if plot_w - (proj_x - plot_left) > 60 {
+                            proj_x + 3
+                        } else {
+                            proj_x - 55
+                        };
+                        draw_text_left(
+                            hdc,
+                            &warn,
+                            POPUP_WIDTH - PAD_R,
+                            label_x,
+                            plot_top + 2,
+                            risk,
+                        );
+                    }
                 }
             }
         }
     }
-}
 
-unsafe fn draw_footer(hdc: HDC, latest: &Option<LatestPrediction>, history: &[HistoryEntry]) {
-    let footer_top = POPUP_HEIGHT - FOOTER_H;
-    let footer_rect = RECT {
-        left: 0,
-        top: footer_top,
-        right: POPUP_WIDTH,
-        bottom: POPUP_HEIGHT,
+    // Current value dot
+    let dot_r = 4;
+    let dot_rect = RECT {
+        left: last_x - dot_r,
+        top: last_y - dot_r,
+        right: last_x + dot_r,
+        bottom: last_y + dot_r,
     };
-    fill_solid(hdc, &footer_rect, COLORREF(0x282828));
+    let brush = CreateSolidBrush(COLOR_HISTORY);
+    let _ = FillRect(hdc, &dot_rect, brush);
+    let _ = DeleteObject(brush);
 
-    // Hawkes sparkline (last 30 entries, scaled 0..max ratio)
-    let spark_left = MARGIN;
-    let spark_top = footer_top + 8;
-    let spark_w = 200;
-    let spark_h = 26;
-    let baseline_y = spark_top + spark_h - 1;
+    draw_x_axis_labels(
+        hdc,
+        session_start,
+        session_end,
+        now_unix,
+        known_session,
+        time_to_x,
+        plot_top,
+        plot_h,
+        plot_left,
+        plot_w,
+    );
+}
 
-    let pen_axis = CreatePen(PS_DOT, 1, COLOR_AXIS);
-    let old_pen = SelectObject(hdc, pen_axis);
-    line(hdc, spark_left, baseline_y, spark_left + spark_w, baseline_y);
-    SelectObject(hdc, old_pen);
-    let _ = DeleteObject(pen_axis);
+unsafe fn draw_x_axis_labels(
+    hdc: HDC,
+    session_start: i64,
+    session_end: i64,
+    now_unix: i64,
+    known_session: bool,
+    time_to_x: impl Fn(i64) -> i32,
+    plot_top: i32,
+    plot_h: i32,
+    plot_left: i32,
+    plot_w: i32,
+) {
+    let y_label = plot_top + plot_h + 5;
 
-    let ratios: Vec<f64> = history
-        .iter()
-        .rev()
-        .take(30)
-        .filter_map(|h| h.hawkes_ratio)
-        .collect();
-    let max_ratio = ratios.iter().copied().fold(1.5_f64, f64::max);
-    if ratios.len() >= 2 {
-        let mut pts: Vec<(i32, i32)> = ratios
-            .iter()
-            .enumerate()
-            .map(|(i, r)| {
-                let x = spark_left + (i as i32 * spark_w / 30);
-                let y = baseline_y - ((r / max_ratio) * spark_h as f64) as i32;
-                (x, y.clamp(spark_top, baseline_y))
-            })
-            .collect();
-        pts.reverse(); // history was reversed for the take; reverse back to time-ordered
-        let pen = CreatePen(PS_SOLID, 1, COLOR_HAWKES);
-        let old_pen = SelectObject(hdc, pen);
-        polyline(hdc, &pts);
-        SelectObject(hdc, old_pen);
-        let _ = DeleteObject(pen);
+    draw_text_left(
+        hdc,
+        &short_local_time(session_start),
+        POPUP_WIDTH - PAD_R,
+        plot_left,
+        y_label,
+        COLOR_DIM,
+    );
+
+    if known_session {
+        draw_text_left(
+            hdc,
+            &short_local_time(session_end),
+            POPUP_WIDTH - PAD_R,
+            plot_left + plot_w - 46,
+            y_label,
+            COLOR_DIM,
+        );
     }
-    draw_text_left(hdc, "Hawkes burst ratio", POPUP_WIDTH, spark_left, spark_top - 14, COLOR_MUTED);
 
-    // Right side: P50/P75/P90 + probability + activity
-    let info_left = spark_left + spark_w + 20;
-    if let Some(p) = latest {
-        let mut y = footer_top + 8;
-        let p50 = p
-            .projected_p50_unix
-            .map(|t| format!("P50 {}", short_time(t)))
-            .unwrap_or_else(|| "P50 -".to_string());
-        let p75 = p
-            .projected_p75_unix
-            .map(|t| format!("P75 {}", short_time(t)))
-            .unwrap_or_else(|| "P75 -".to_string());
-        let p90 = p
-            .projected_p90_unix
-            .map(|t| format!("P90 {}", short_time(t)))
-            .unwrap_or_else(|| "P90 -".to_string());
-        draw_text_left(hdc, &p50, POPUP_WIDTH, info_left, y, COLOR_P50);
-        y += 14;
-        draw_text_left(hdc, &p75, POPUP_WIDTH, info_left, y, COLOR_P75);
-        y += 14;
-        draw_text_left(hdc, &p90, POPUP_WIDTH, info_left, y, COLOR_P90);
-        y += 16;
-        let prob = format!("pE {:.2}", p.prob_empty_before_refresh);
-        draw_text_left(hdc, &prob, POPUP_WIDTH, info_left, y, COLOR_FG);
-
-        // Bottom strip: status text spanning the footer width
-        let status = format!(
-            "act={}{}{}",
-            p.activity,
-            if p.frozen { " (frozen)" } else { "" },
-            p.reason
-                .as_deref()
-                .map(|r| format!(" -- {r}"))
-                .unwrap_or_default()
-        );
-        draw_text_left(
-            hdc,
-            &status,
-            POPUP_WIDTH - MARGIN,
-            MARGIN,
-            POPUP_HEIGHT - 18,
-            COLOR_MUTED,
-        );
-    } else {
-        draw_text_left(
-            hdc,
-            "(no prediction yet)",
-            POPUP_WIDTH,
-            info_left,
-            footer_top + 8,
-            COLOR_MUTED,
-        );
-        let _ = history;
+    if now_unix > session_start && now_unix < session_end {
+        let nx = time_to_x(now_unix);
+        if nx - plot_left > 28 && plot_left + plot_w - nx > 28 {
+            draw_text_left(hdc, "now", POPUP_WIDTH - PAD_R, nx - 9, y_label, COLOR_NOW);
+        }
     }
 }
 
-/// HH:MMZ rendering of a Unix timestamp, in UTC.
-fn short_time(unix: i64) -> String {
-    let secs_of_day = unix.rem_euclid(86_400);
-    let hour = (secs_of_day / 3600) as u32;
-    let minute = ((secs_of_day % 3600) / 60) as u32;
-    format!("{hour:02}:{minute:02}Z")
+unsafe fn draw_hint(hdc: HDC, text: &str, x: i32, y: i32) {
+    draw_text_left(hdc, text, POPUP_WIDTH - PAD_R, x, y, COLOR_HINT);
+}
+
+/// Render a Unix-timestamp as the user's local-time "h:mmtt" lowercase,
+/// matching CSM's CultureInfo.InvariantCulture formatting. Uses the local
+/// timezone via the Win32 conversion path so DST etc. is respected.
+fn short_local_time(unix: i64) -> String {
+    use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows::Win32::System::Time::{
+        FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime,
+    };
+
+    // Unix epoch in 100-ns ticks since 1601-01-01: 11644473600 seconds.
+    let ticks = ((unix as i128) + 11_644_473_600) * 10_000_000;
+    let ft = FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    unsafe {
+        let mut utc = SYSTEMTIME::default();
+        if FileTimeToSystemTime(&ft, &mut utc).is_err() {
+            return "?".into();
+        }
+        let mut local = SYSTEMTIME::default();
+        if SystemTimeToTzSpecificLocalTime(None, &utc, &mut local).is_err() {
+            return "?".into();
+        }
+        let mut hour12 = local.wHour % 12;
+        if hour12 == 0 {
+            hour12 = 12;
+        }
+        let suffix = if local.wHour < 12 { "am" } else { "pm" };
+        format!("{}:{:02}{}", hour12, local.wMinute, suffix)
+    }
 }
 
 // ---------------- GDI helpers ----------------
@@ -590,6 +595,27 @@ unsafe fn fill_solid(hdc: HDC, rect: &RECT, color: COLORREF) {
     let brush = CreateSolidBrush(color);
     FillRect(hdc, rect, brush);
     let _ = DeleteObject(brush);
+}
+
+unsafe fn create_dashed_pen(color: COLORREF, dash: &[u32]) -> HPEN {
+    // ExtCreatePen with a user-defined dash pattern; we fall back to PS_DASH
+    // if the extended call fails on the runtime.
+    let logbrush = LOGBRUSH {
+        lbStyle: BS_SOLID,
+        lbColor: color,
+        lbHatch: 0,
+    };
+    let pen = ExtCreatePen(
+        PS_GEOMETRIC | PS_USERSTYLE | PS_ENDCAP_FLAT,
+        1,
+        &logbrush,
+        Some(dash),
+    );
+    if pen.is_invalid() {
+        CreatePen(PS_DASH, 1, color)
+    } else {
+        pen
+    }
 }
 
 unsafe fn line(hdc: HDC, x1: i32, y1: i32, x2: i32, y2: i32) {
@@ -623,34 +649,5 @@ unsafe fn draw_text_left(
         &mut buf,
         &mut rect,
         DT_LEFT | DT_SINGLELINE | DT_NOPREFIX,
-    );
-}
-
-unsafe fn draw_text_right(hdc: HDC, text: &str, right_x: i32, y: i32, color: COLORREF) {
-    SetTextColor(hdc, color);
-    let mut buf: Vec<u16> = OsStr::new(text).encode_wide().collect();
-    let mut rect = RECT {
-        left: 0,
-        top: y,
-        right: right_x,
-        bottom: y + 24,
-    };
-    DrawTextW(
-        hdc,
-        &mut buf,
-        &mut rect,
-        DT_RIGHT | DT_SINGLELINE | DT_NOPREFIX,
-    );
-}
-
-unsafe fn draw_text_centered(hdc: HDC, text: &str, rect: &RECT, color: COLORREF) {
-    SetTextColor(hdc, color);
-    let mut buf: Vec<u16> = OsStr::new(text).encode_wide().collect();
-    let mut r = *rect;
-    DrawTextW(
-        hdc,
-        &mut buf,
-        &mut r,
-        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
     );
 }
