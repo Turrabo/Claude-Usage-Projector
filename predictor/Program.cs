@@ -54,6 +54,29 @@ if (persisted.Count > 0)
 {
     snapshots.Seed(persisted, DateTimeOffset.UtcNow);
     Log("info", $"persistence: loaded {persisted.Count} snapshots (skipped {skipped} malformed)");
+
+    // Replay loaded snapshots to the host as tier=0 ("backfill") prediction
+    // messages so the popup's history line is populated immediately on a
+    // fresh launch. The host's prediction_store sees tier=0 and pushes only
+    // to history, leaving `latest` untouched for the live prediction that
+    // arrives on the next observe.
+    foreach (var s in snapshots.Snapshots)
+    {
+        if (!s.UsedPercent.HasValue) continue;
+        var backfill = new PredictionMessage
+        {
+            TimestampUtc = FormatUtc(s.CapturedAtUtc),
+            Tier = 0,
+            Risk = "unknown",
+            Stale = false,
+            UsedPercent = s.UsedPercent,
+            RefreshAtUtc = s.RefreshAtUtc is { } r ? FormatUtc(r) : null,
+            ProbabilityEmptyBeforeRefresh = 0.0,
+        };
+        var backfillLine = JsonSerializer.Serialize(backfill, IpcJsonContext.Default.PredictionMessage);
+        Console.Out.WriteLine(backfillLine);
+    }
+    Console.Out.Flush();
 }
 else if (skipped > 0)
 {

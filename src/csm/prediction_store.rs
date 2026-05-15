@@ -12,7 +12,7 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::csm::ipc::PredictionMessage;
 
-const HISTORY_LIMIT: usize = 180; // ~3 hours at one prediction per minute
+const HISTORY_LIMIT: usize = 600; // ~10 hours at one prediction per minute
 
 #[derive(Clone, Debug)]
 #[allow(dead_code)] // some fields read only by future popup expansion
@@ -86,6 +86,20 @@ impl PredictionStore {
                 .unwrap_or_else(|| "unknown".to_string()),
             frozen: msg.rate_frozen_from_idle.unwrap_or(false),
         };
+
+        // tier=0 is the predictor's "backfill" marker emitted at startup for
+        // each replayed historical observation. Push it into history so the
+        // chart line is populated immediately, but leave `latest` alone —
+        // there's no live projection or risk to display for a stale point.
+        if msg.tier == 0 {
+            if let Ok(mut inner) = self.inner.lock() {
+                if inner.history.len() == HISTORY_LIMIT {
+                    inner.history.pop_front();
+                }
+                inner.history.push_back(entry);
+            }
+            return;
+        }
 
         let latest = LatestPrediction {
             computed_unix,
