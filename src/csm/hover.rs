@@ -29,6 +29,7 @@ const SHOW_DELAY: Duration = Duration::from_millis(200);
 const HIDE_GRACE: Duration = Duration::from_millis(100);
 
 const WIDGET_CLASS_NAME: &str = "ClaudeCodeUsageMonitor";
+const TASKBAR_CLASS_NAME: &str = "Shell_TrayWnd";
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static STARTED: OnceLock<()> = OnceLock::new();
@@ -61,10 +62,13 @@ fn wide(s: &str) -> Vec<u16> {
 
 fn hover_thread() {
     diagnose::log("hover: thread started");
-    let class_name = wide(WIDGET_CLASS_NAME);
-    let class_pcwstr = PCWSTR::from_raw(class_name.as_ptr());
+    let widget_class = wide(WIDGET_CLASS_NAME);
+    let widget_class_pcwstr = PCWSTR::from_raw(widget_class.as_ptr());
+    let taskbar_class = wide(TASKBAR_CLASS_NAME);
+    let taskbar_class_pcwstr = PCWSTR::from_raw(taskbar_class.as_ptr());
 
     let mut state = HoverState::Out;
+    let mut widget_found_once = false;
 
     while !SHUTDOWN.load(Ordering::Acquire) {
         let cursor = match cursor_pos() {
@@ -75,12 +79,42 @@ fn hover_thread() {
             }
         };
 
-        // Locate the widget HWND every tick. Cheap (~µs) and keeps us
-        // resilient across restarts / DPI changes that re-create the window.
-        let widget_hwnd = unsafe { FindWindowW(class_pcwstr, PCWSTR::null()) };
-        let widget_rect = widget_hwnd
-            .ok()
-            .and_then(|h| if h.is_invalid() { None } else { window_rect(h) });
+        // The widget gets reparented into Shell_TrayWnd when embedding succeeds
+        // (the common case). FindWindowW only walks top-level windows, so we
+        // first try FindWindowExW under the taskbar; if that fails, fall back
+        // to the top-level lookup for the rare fallback-popup mode.
+        let widget_hwnd = unsafe {
+            let mut found: Option<HWND> = None;
+            if let Ok(tray) = FindWindowW(taskbar_class_pcwstr, PCWSTR::null()) {
+                if !tray.is_invalid() {
+                    if let Ok(child) =
+                        FindWindowExW(tray, HWND::default(), widget_class_pcwstr, PCWSTR::null())
+                    {
+                        if !child.is_invalid() {
+                            found = Some(child);
+                        }
+                    }
+                }
+            }
+            if found.is_none() {
+                if let Ok(top) = FindWindowW(widget_class_pcwstr, PCWSTR::null()) {
+                    if !top.is_invalid() {
+                        found = Some(top);
+                    }
+                }
+            }
+            found
+        };
+        let widget_rect = widget_hwnd.and_then(window_rect);
+        if !widget_found_once && widget_rect.is_some() {
+            widget_found_once = true;
+            if let Some(r) = widget_rect.as_ref() {
+                diagnose::log(format!(
+                    "hover: widget located at L={} T={} R={} B={}",
+                    r.left, r.top, r.right, r.bottom
+                ));
+            }
+        }
 
         let popup_rect = popup::popup_screen_rect();
 
@@ -106,6 +140,7 @@ fn hover_thread() {
                         let cx = (rect.left + rect.right) / 2;
                         let cy = rect.top;
                         popup::show_at(cx, cy);
+                        diagnose::log(format!("hover: popup show requested at ({cx},{cy})"));
                     }
                     HoverState::Shown
                 } else {
@@ -143,6 +178,9 @@ fn cursor_pos() -> Option<POINT> {
 }
 
 fn window_rect(hwnd: HWND) -> Option<RECT> {
+    if hwnd.is_invalid() {
+        return None;
+    }
     let mut r = RECT::default();
     unsafe { GetWindowRect(hwnd, &mut r).ok().map(|_| r) }
 }
