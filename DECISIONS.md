@@ -74,7 +74,7 @@ Publish the predictor as `dotnet publish -c Release -r win-x64 --self-contained 
 ## ADR-004: JSONL append-only files for predictor storage, not SQLite
 
 **Date:** 2026-05-13
-**Status:** Accepted
+**Status:** Accepted — see ADR-008 for the read-only one-time-migration supplement.
 
 ### Context
 
@@ -131,7 +131,7 @@ CodeZeno's widget is a small embedded child of `Shell_TrayWnd` (~210 × 46 px) s
 
 ### Decision
 
-Add a separate borderless `WS_EX_NOACTIVATE` popup window that appears after 200 ms of continuous mouse-hover over the widget and dismisses on mouse-leave with a 100 ms grace period. The popup is ~480 × 320 px, painted with raw GDI (Win32), and lives entirely in fork-authored code (`src/csm/popup.rs`, planned Phase 4).
+Add a separate borderless `WS_EX_NOACTIVATE` popup window that appears after 200 ms of continuous mouse-hover over the widget and dismisses on mouse-leave with a 100 ms grace period. The popup is 450 × 160 px (matched to the predecessor CSM's `ChartPopover` after a minify pass — see commit `80707eb`), painted with raw GDI (Win32), and lives entirely in fork-authored code (`src/csm/popup.rs`).
 
 ### Consequences
 
@@ -160,3 +160,27 @@ A cron-scheduled GitHub Actions workflow (`.github/workflows/upstream-sync.yml`)
 - Conflicting upstream changes surface immediately, not weeks later when the conflict is bigger.
 - Workflow runs on `ubuntu-latest` (no build, just git operations) — essentially free CI minutes.
 - The sentinel-comment discipline (CSM EXTENSIONS BEGIN/END) is what keeps conflicts rare. Adding new touch points to upstream files raises this ADR's maintenance cost; prefer additive new files when possible.
+
+---
+
+## ADR-008: Microsoft.Data.Sqlite in the predictor for the one-time CSM migration
+
+**Date:** 2026-05-15
+**Status:** Accepted
+
+### Context
+
+ADR-004 ruled out SQLite for the predictor's storage layer and listed "zero native dependencies" as a benefit. Phase 5 (commit `3f6e26f`) needed to read the predecessor's `%LOCALAPPDATA%\ClaudeSessionMonitor\csm.sqlite` once at first run to seed `history.jsonl` with truth-source rows from the prior project. Options considered: (a) write a tiny custom SQLite parser; (b) ship a separate one-shot migration tool; (c) add `Microsoft.Data.Sqlite` to the predictor csproj and run the migration in-process on first launch.
+
+(a) was rejected because hand-rolling a SQLite reader is fragile and unnecessarily clever for ~400 rows of read-only access. (b) was rejected because a separate tool is clumsy UX — the user would forget to run it — and the value of the seed evaporates after the first launch of the predictor on a fresh machine.
+
+### Decision
+
+Add `Microsoft.Data.Sqlite` to `Predictor.csproj` and run the migration inside `predictor/Persistence/CsmSqliteMigrator.cs`. The package is bundled into the self-contained single-file publish; the native `e_sqlite3.dll` ships inside `ccum-predictor.exe` and is extracted to a temp path on first launch like every other native dep in the bundle. The migration runs once, writes a `.csm-migrated` sentinel, and is skipped on every subsequent launch.
+
+### Consequences
+
+- ADR-004's "zero native dependencies at runtime for prediction work" still holds in spirit — the SQLite code path is only ever exercised during the first-run migration. Once the sentinel is in place, no SQLite calls happen during steady-state operation.
+- Single-file exe size grew from ~35 MB to ~36 MB. Acceptable.
+- Microsoft.Data.Sqlite is a soft regression of ADR-003's AOT-friendliness — its native dependency is not AOT-compatible the way pure managed code is. Phase 5 isn't on the AOT path today, but a future AOT switch would need to either drop the migrator or compile it as a separate tool. Acceptable for now.
+- The migration window is hard-coded to the last 14 days (`CsmSqliteMigrator.MigrationWindowDays`). Older CSM data is left in `csm.sqlite` untouched; it's outside the popup chart's current-session window anyway, so importing it would be wasted bytes.

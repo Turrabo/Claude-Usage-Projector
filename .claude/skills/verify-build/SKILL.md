@@ -1,6 +1,6 @@
 ---
 name: verify-build
-description: Smoke-test a Claude-Usage-Projector CI build end-to-end on this Windows machine. Resolves the target commit, waits for CI green, kills any running widget, clears C:\Source\Claude-Usage-Projector\target\phase-1\, downloads both GitHub Actions artifacts via gh CLI, flattens them so the host can find the predictor, unblocks the .exes, and launches the host with --diagnose. Stops short of log inspection — that's the user's call.
+description: Smoke-test a Claude-Usage-Projector CI build end-to-end on this Windows machine. Resolves the target commit, waits for CI green, kills any running widget, clears C:\Source\Claude-Usage-Projector\target\verify-build\, downloads both GitHub Actions artifacts via gh CLI, flattens them so the host can find the predictor, unblocks the .exes, and launches the host with --diagnose. Stops short of log inspection — that's the user's call.
 ---
 
 # /verify-build — fetch & launch a CI build for E2E testing
@@ -42,9 +42,9 @@ After this is done once, gh's token is stored in the Windows keyring and survive
    Get-Process claude-code-usage-monitor -ErrorAction SilentlyContinue | Stop-Process -Force
    ```
 
-4. **Prepare the sandbox at `C:\Source\Claude-Usage-Projector\target\phase-1\`.** Always wipe first — stale files from a prior verify would be co-located with new ones and the host would launch the wrong predictor. Recreate empty:
+4. **Prepare the sandbox at `C:\Source\Claude-Usage-Projector\target\verify-build\`.** Always wipe first — stale files from a prior verify would be co-located with new ones and the host would launch the wrong predictor. Recreate empty:
    ```powershell
-   $sandbox = 'C:\Source\Claude-Usage-Projector\target\phase-1'
+   $sandbox = 'C:\Source\Claude-Usage-Projector\target\verify-build'
    Remove-Item $sandbox -Recurse -Force -ErrorAction SilentlyContinue
    New-Item -ItemType Directory -Path $sandbox -Force | Out-Null
    ```

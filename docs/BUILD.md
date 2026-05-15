@@ -149,8 +149,21 @@ After the host launches, the diagnose log at `%TEMP%\claude-code-usage-monitor.l
 [<ts>] csm: predictor sidecar started
 [<ts>] window shown
 [<ts>] initial poll thread started
-[<ts>] predictor[info] ccum-predictor v0.1.0 started (pid=<n>)
+[<ts>] predictor[info] ccum-predictor v0.5.0 started (pid=<n>)
 [<ts>] predictor[info] observed @ <iso8601>  cc 5h=<x>% 7d=<y>%  cx=<z|none>
+[<ts>] predictor[pred] tier=2 risk=... used=...% rate=...%/min p50=... pE=... stale=... act=...
 ```
 
-The last two lines prove both IPC directions are working — the predictor logged its own startup and acknowledged an observation from the host.
+The last three lines prove the full IPC + prediction pipeline is working — the predictor logged its own startup, acknowledged an observation, and emitted a prediction the host re-formatted onto the diagnose log.
+
+---
+
+## Running tests
+
+The predictor has an xUnit test project at [`predictor/Predictor.Tests/`](../predictor/Predictor.Tests/) wired into [`predictor/predictor.sln`](../predictor/predictor.sln). CI runs them automatically; locally:
+
+```powershell
+dotnet test predictor/predictor.sln -c Release
+```
+
+Tests cover the Hawkes math, the Monte Carlo projection engine, the JSONL adapter, the tier 1 predictor with idle-freeze, and the persistence + CSM migration paths. ~60 tests, sub-second runtime.
