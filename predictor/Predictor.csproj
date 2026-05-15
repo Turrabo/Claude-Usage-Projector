@@ -22,6 +22,10 @@
 
   <ItemGroup>
     <PackageReference Include="MathNet.Numerics" Version="5.0.0" />
+    <!-- Read-only access to the predecessor CSM's csm.sqlite during the
+         one-time first-run migration. Native dep (e_sqlite3.dll) is bundled
+         into the single-file publish; runtime impact is the disk size only. -->
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.0" />
   </ItemGroup>
 
   <ItemGroup>

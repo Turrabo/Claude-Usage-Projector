@@ -42,4 +42,24 @@ public sealed class ObservationWindow
             _snapshots.RemoveRange(0, _snapshots.Count - _maxCapacity);
         }
     }
+
+    /// <summary>
+    /// Bulk load a chronologically-ordered batch (typically read back from
+    /// the persistence layer at startup). Replaces any existing content.
+    /// Applies the same retention rule once at the end.
+    /// </summary>
+    public void Seed(IEnumerable<UsageSnapshot> snapshots, DateTimeOffset now)
+    {
+        _snapshots.Clear();
+        _snapshots.AddRange(snapshots);
+        _snapshots.Sort((a, b) => a.CapturedAtUtc.CompareTo(b.CapturedAtUtc));
+
+        var cutoff = now - TimeSpan.FromMinutes(_retentionMinutes);
+        _snapshots.RemoveAll(s => s.CapturedAtUtc < cutoff);
+
+        if (_snapshots.Count > _maxCapacity)
+        {
+            _snapshots.RemoveRange(0, _snapshots.Count - _maxCapacity);
+        }
+    }
 }

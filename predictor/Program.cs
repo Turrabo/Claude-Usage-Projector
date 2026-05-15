@@ -4,20 +4,31 @@ using ClaudeUsageProjector.Predictor.Activity;
 using ClaudeUsageProjector.Predictor.Adapters;
 using ClaudeUsageProjector.Predictor.Hawkes;
 using ClaudeUsageProjector.Predictor.Ipc;
+using ClaudeUsageProjector.Predictor.Persistence;
 using ClaudeUsageProjector.Predictor.Projection;
 using ClaudeUsageProjector.Predictor.State;
 using ClaudeUsageProjector.Predictor.Tiers;
 
-// ccum-predictor — Phase 3 wiring.
+// ccum-predictor — Phase 5 wiring.
 //
 // Reads line-delimited JSON messages from stdin:
 //   {"v":1,"type":"observe","t":"...","cc":{...},"cx":null}
 //   {"v":1,"type":"shutdown"}
 //
-// On each observe we update the rolling snapshot window, run Tier 1/2/3, and
-// emit a prediction message on stdout. In parallel a background JSONL tail
-// thread feeds Claude Code session events into a telemetry window the
-// predictor reads for activity-mode classification and Hawkes intensity.
+// On each observe we update the rolling snapshot window, persist the new
+// observation to history.jsonl, run Tier 1/2/3, and emit a prediction. In
+// parallel the JSONL tail feeds Claude Code session events into the
+// telemetry window for activity-mode classification and Hawkes intensity.
+//
+// On startup we restore prior state in two ways:
+//   1. Any rows in %APPDATA%/Claude-Code-Usage-Monitor/predictor/history*.jsonl
+//      are loaded into the ObservationWindow (CSM SQLite is migrated into
+//      that file on first run as a one-time bootstrap).
+//   2. The JSONL tail seeds each session file's offset to the position of
+//      the first line whose timestamp is newer than now - 6h, so Hawkes
+//      doesn't have to re-warm from cold on every relaunch.
+
+PersistencePaths.EnsureRootExists();
 
 var snapshots = new ObservationWindow();
 var telemetry = new TelemetryWindow();
@@ -25,6 +36,29 @@ var activityDetector = new JsonlActivityDetector();
 var monteCarlo = new MonteCarloProjectionEngine();
 var hawkesScaler = new DefaultHawkesIntensityScaler();
 var tier = new Tier1WeightedBurnRate(new PredictorOptions(), monteCarlo, hawkesScaler);
+
+var historyWriter = new HistoryJsonlWriter();
+
+// One-time-at-first-run migration from the CSM SQLite database.
+var migrator = new CsmSqliteMigrator(historyWriter, Log);
+var migrated = migrator.MigrateIfNeeded();
+if (migrated is int m && m > 0)
+{
+    Log("info", $"persistence: seeded {m} rows from CSM SQLite");
+}
+
+// Restore the in-memory window from disk so the popup chart survives reboots.
+var reader = new HistoryJsonlReader();
+var persisted = reader.LoadAll(out var skipped);
+if (persisted.Count > 0)
+{
+    snapshots.Seed(persisted, DateTimeOffset.UtcNow);
+    Log("info", $"persistence: loaded {persisted.Count} snapshots (skipped {skipped} malformed)");
+}
+else if (skipped > 0)
+{
+    Log("warn", $"persistence: no usable rows ({skipped} malformed lines)");
+}
 
 var jsonlRoot = JsonlTail.DefaultRoot();
 JsonlTail? tail = null;
@@ -38,7 +72,7 @@ catch (Exception ex)
     Log("warn", $"jsonl tail failed to start: {ex.Message}");
 }
 
-Log("info", $"ccum-predictor v0.3.0 started (pid={Environment.ProcessId})");
+Log("info", $"ccum-predictor v0.5.0 started (pid={Environment.ProcessId})");
 
 string? line;
 while ((line = Console.In.ReadLine()) is not null)
@@ -65,11 +99,12 @@ while ((line = Console.In.ReadLine()) is not null)
         switch (messageType)
         {
             case "observe":
-                HandleObserve(line, snapshots, telemetry, activityDetector, tier);
+                HandleObserve(line, snapshots, telemetry, activityDetector, tier, historyWriter);
                 break;
             case "shutdown":
                 Log("info", "shutdown received");
                 tail?.Dispose();
+                historyWriter.Dispose();
                 return;
             default:
                 Log("warn", $"unknown message type: {messageType}");
@@ -80,6 +115,7 @@ while ((line = Console.In.ReadLine()) is not null)
 
 Log("info", "stdin closed; exiting");
 tail?.Dispose();
+historyWriter.Dispose();
 return;
 
 
@@ -88,7 +124,8 @@ static void HandleObserve(
     ObservationWindow snapshots,
     TelemetryWindow telemetry,
     IActivityDetector detector,
-    Tier1WeightedBurnRate tier)
+    Tier1WeightedBurnRate tier,
+    HistoryJsonlWriter writer)
 {
     ObserveMessage? observe;
     try
@@ -131,12 +168,21 @@ static void HandleObserve(
         refreshAt = parsedRefresh.ToUniversalTime();
     }
 
-    snapshots.Add(new UsageSnapshot
+    var snapshot = new UsageSnapshot
     {
         CapturedAtUtc = capturedAt,
         UsedPercent = observe.ClaudeCode.FiveHourPct,
         RefreshAtUtc = refreshAt,
-    });
+    };
+    snapshots.Add(snapshot);
+    try
+    {
+        writer.Append(snapshot);
+    }
+    catch (Exception ex)
+    {
+        Log("warn", $"persistence: append failed -- {ex.Message}");
+    }
 
     var telemetrySnapshot = telemetry.Snapshot();
     var activity = detector.Detect(telemetrySnapshot, capturedAt);
