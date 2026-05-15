@@ -148,7 +148,7 @@ fn popup_thread() {
             WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
             PCWSTR::from_raw(class_name.as_ptr()),
             PCWSTR::null(),
-            WS_POPUP | WS_BORDER,
+            WS_POPUP,
             0,
             0,
             POPUP_WIDTH,
@@ -170,6 +170,21 @@ fn popup_thread() {
                 return;
             }
         };
+
+        // Rounded corners via window region. SetWindowRgn takes ownership of
+        // the HRGN, so it must NOT be deleted afterwards. CreateRoundRectRgn's
+        // width/height are exclusive bounds, hence the +1.
+        let region = CreateRoundRectRgn(
+            0,
+            0,
+            POPUP_WIDTH + 1,
+            POPUP_HEIGHT + 1,
+            CORNER_RADIUS * 2,
+            CORNER_RADIUS * 2,
+        );
+        if !region.is_invalid() {
+            let _ = SetWindowRgn(hwnd, region, BOOL(1));
+        }
 
         POPUP_HWND.store(hwnd.0 as isize, Ordering::Release);
         diagnose::log(format!("popup: created hwnd={:?}", hwnd));
@@ -273,10 +288,13 @@ fn position_relative_to(anchor_x: i32, anchor_y: i32) -> (i32, i32) {
 // ---------------- Painting ----------------
 
 // All sizes in client-area pixels.
-const PAD_L: i32 = 32;
-const PAD_R: i32 = 10;
-const PAD_T: i32 = 10;
-const PAD_B: i32 = 22;
+// Inner padding leaves a CSM-equivalent ~8 px gap between the outer rounded
+// edge and the chart content, plus extra at left/bottom for axis labels.
+const CORNER_RADIUS: i32 = 6;
+const PAD_L: i32 = 40;
+const PAD_R: i32 = 16;
+const PAD_T: i32 = 16;
+const PAD_B: i32 = 28;
 
 // COLORREF is 0x00BBGGRR. Define the CSM palette literally.
 const COLOR_BG: COLORREF = COLORREF(0x181818);
@@ -371,7 +389,9 @@ unsafe fn paint_chart(
     for p in [0, 25, 50, 75, 100] {
         let y = pct_to_y(p as f64);
         line(hdc, plot_left, y, plot_right, y);
-        draw_text_left(hdc, &format!("{p}%"), plot_left - 4, 2, y - 7, COLOR_DIM);
+        // x=10 keeps the label inside the rounded corner safe-zone while still
+        // looking close-but-not-touching against the left edge.
+        draw_text_left(hdc, &format!("{p}%"), plot_left - 4, 10, y - 7, COLOR_DIM);
     }
     SelectObject(hdc, old_pen);
     let _ = DeleteObject(pen_grid);
