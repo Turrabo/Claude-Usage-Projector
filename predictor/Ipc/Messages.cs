@@ -103,6 +103,25 @@ public sealed record PredictionMessage
 
     /// <summary>"deterministic" or "monte-carlo".</summary>
     [JsonPropertyName("engine")] public string? Engine { get; init; }
+
+    // ---- Phase 3 fields ----
+
+    /// <summary>"unknown" | "idle" | "active".</summary>
+    [JsonPropertyName("activity")] public string? ActivityMode { get; init; }
+
+    /// <summary>Distinct Claude Code sessions seen in the last concurrency window.</summary>
+    [JsonPropertyName("active_sessions")] public int? ActiveSessionCount { get; init; }
+
+    /// <summary>True when the rate was held at the cached active value because the user is idle.</summary>
+    [JsonPropertyName("rate_frozen_from_idle")] public bool RateFrozenFromIdle { get; init; }
+
+    /// <summary>Hawkes intensity ratio λ(now)/μ. &gt;1 = bursting, =1 = baseline. Diagnostic only.</summary>
+    [JsonPropertyName("hawkes_ratio")] public double? HawkesIntensityRatio { get; init; }
+
+    [JsonPropertyName("hawkes_mu")] public double? HawkesMu { get; init; }
+    [JsonPropertyName("hawkes_alpha")] public double? HawkesAlpha { get; init; }
+    [JsonPropertyName("hawkes_beta")] public double? HawkesBeta { get; init; }
+    [JsonPropertyName("hawkes_events")] public int? HawkesEventsConsidered { get; init; }
 }
 
 // Source-generated JSON context (AOT-friendly even though we currently

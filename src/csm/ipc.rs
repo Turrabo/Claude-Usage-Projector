@@ -95,4 +95,14 @@ pub struct PredictionMessage {
     pub projected_pct_at_refresh: Option<f64>,
     pub projected_empty_before_refresh: Option<bool>,
     pub engine: Option<String>,
+
+    // Phase 3 — activity + Hawkes diagnostic fields.
+    pub activity: Option<String>,
+    pub active_sessions: Option<u32>,
+    pub rate_frozen_from_idle: Option<bool>,
+    pub hawkes_ratio: Option<f64>,
+    pub hawkes_mu: Option<f64>,
+    pub hawkes_alpha: Option<f64>,
+    pub hawkes_beta: Option<f64>,
+    pub hawkes_events: Option<u32>,
 }

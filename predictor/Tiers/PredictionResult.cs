@@ -30,4 +30,17 @@ public sealed record PredictionResult
     public bool ProjectedEmptyBeforeRefresh { get; init; }
 
     public string? Engine { get; init; }
+
+    // Phase 3 fields. The activity signal feeds the idle-freeze branch in
+    // Tier 1; the Hawkes ratio is currently diagnostic-only (recorded for
+    // observation, not yet used to scale rates — see project memory).
+    public string? ActivityMode { get; init; }
+    public int? ActiveSessionCount { get; init; }
+    public bool RateFrozenFromIdle { get; init; }
+
+    public double? HawkesIntensityRatio { get; init; }
+    public double? HawkesMu { get; init; }
+    public double? HawkesAlpha { get; init; }
+    public double? HawkesBeta { get; init; }
+    public int? HawkesEventsConsidered { get; init; }
 }

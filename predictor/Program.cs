@@ -1,26 +1,44 @@
 using System;
 using System.Text.Json;
+using ClaudeUsageProjector.Predictor.Activity;
+using ClaudeUsageProjector.Predictor.Adapters;
+using ClaudeUsageProjector.Predictor.Hawkes;
 using ClaudeUsageProjector.Predictor.Ipc;
 using ClaudeUsageProjector.Predictor.Projection;
 using ClaudeUsageProjector.Predictor.State;
 using ClaudeUsageProjector.Predictor.Tiers;
 
-// ccum-predictor — Phase 2 wiring.
+// ccum-predictor — Phase 3 wiring.
 //
-// Reads line-delimited JSON messages from stdin. Each line should be one of:
+// Reads line-delimited JSON messages from stdin:
 //   {"v":1,"type":"observe","t":"...","cc":{...},"cx":null}
 //   {"v":1,"type":"shutdown"}
 //
-// For each observation we update the rolling window, run Tier 1 + Tier 2, and
-// emit a prediction message on stdout. The Codex bucket is observed and logged
-// but not yet used in predictions — Phase 3 will fan out the predictor per
-// tracked product.
+// On each observe we update the rolling snapshot window, run Tier 1/2/3, and
+// emit a prediction message on stdout. In parallel a background JSONL tail
+// thread feeds Claude Code session events into a telemetry window the
+// predictor reads for activity-mode classification and Hawkes intensity.
 
-var window = new ObservationWindow();
+var snapshots = new ObservationWindow();
+var telemetry = new TelemetryWindow();
+var activityDetector = new JsonlActivityDetector();
 var monteCarlo = new MonteCarloProjectionEngine();
-var tier = new Tier1WeightedBurnRate(new PredictorOptions(), monteCarlo);
+var hawkesScaler = new DefaultHawkesIntensityScaler();
+var tier = new Tier1WeightedBurnRate(new PredictorOptions(), monteCarlo, hawkesScaler);
 
-Log("info", $"ccum-predictor v0.2.0 started (pid={Environment.ProcessId})");
+var jsonlRoot = JsonlTail.DefaultRoot();
+JsonlTail? tail = null;
+try
+{
+    tail = new JsonlTail(jsonlRoot, telemetry, Log);
+    tail.Start();
+}
+catch (Exception ex)
+{
+    Log("warn", $"jsonl tail failed to start: {ex.Message}");
+}
+
+Log("info", $"ccum-predictor v0.3.0 started (pid={Environment.ProcessId})");
 
 string? line;
 while ((line = Console.In.ReadLine()) is not null)
@@ -47,10 +65,11 @@ while ((line = Console.In.ReadLine()) is not null)
         switch (messageType)
         {
             case "observe":
-                HandleObserve(line, window, tier);
+                HandleObserve(line, snapshots, telemetry, activityDetector, tier);
                 break;
             case "shutdown":
                 Log("info", "shutdown received");
+                tail?.Dispose();
                 return;
             default:
                 Log("warn", $"unknown message type: {messageType}");
@@ -60,10 +79,16 @@ while ((line = Console.In.ReadLine()) is not null)
 }
 
 Log("info", "stdin closed; exiting");
+tail?.Dispose();
 return;
 
 
-static void HandleObserve(string rawLine, ObservationWindow window, Tier1WeightedBurnRate tier)
+static void HandleObserve(
+    string rawLine,
+    ObservationWindow snapshots,
+    TelemetryWindow telemetry,
+    IActivityDetector detector,
+    Tier1WeightedBurnRate tier)
 {
     ObserveMessage? observe;
     try
@@ -106,14 +131,16 @@ static void HandleObserve(string rawLine, ObservationWindow window, Tier1Weighte
         refreshAt = parsedRefresh.ToUniversalTime();
     }
 
-    window.Add(new UsageSnapshot
+    snapshots.Add(new UsageSnapshot
     {
         CapturedAtUtc = capturedAt,
         UsedPercent = observe.ClaudeCode.FiveHourPct,
         RefreshAtUtc = refreshAt,
     });
 
-    var result = tier.Compute(window.Snapshots, capturedAt);
+    var telemetrySnapshot = telemetry.Snapshot();
+    var activity = detector.Detect(telemetrySnapshot, capturedAt);
+    var result = tier.Compute(snapshots.Snapshots, activity, telemetrySnapshot, capturedAt);
     EmitPrediction(result);
 }
 
@@ -137,6 +164,14 @@ static void EmitPrediction(PredictionResult r)
         ProjectedPercentAtRefresh = r.ProjectedPercentAtRefresh,
         ProjectedEmptyBeforeRefresh = r.ProjectedEmptyBeforeRefresh,
         Engine = r.Engine,
+        ActivityMode = r.ActivityMode?.ToLowerInvariant(),
+        ActiveSessionCount = r.ActiveSessionCount,
+        RateFrozenFromIdle = r.RateFrozenFromIdle,
+        HawkesIntensityRatio = r.HawkesIntensityRatio,
+        HawkesMu = r.HawkesMu,
+        HawkesAlpha = r.HawkesAlpha,
+        HawkesBeta = r.HawkesBeta,
+        HawkesEventsConsidered = r.HawkesEventsConsidered,
     };
     var line = JsonSerializer.Serialize(message, IpcJsonContext.Default.PredictionMessage);
     Console.Out.WriteLine(line);

@@ -199,22 +199,26 @@ fn format_prediction(p: &crate::csm::ipc::PredictionMessage) -> String {
     let prob = p.prob_empty_before_refresh.unwrap_or(0.0);
     let stale = p.stale.unwrap_or(false);
     let reason = p.reason.as_deref().unwrap_or("");
+    let activity = p.activity.as_deref().unwrap_or("?");
+    let frozen = if p.rate_frozen_from_idle.unwrap_or(false) {
+        " frozen"
+    } else {
+        ""
+    };
+    let hawkes = match p.hawkes_ratio {
+        Some(r) => format!(" hawkes={r:.2}"),
+        None => String::new(),
+    };
+    // ASCII separator only — the diagnose log file is read by viewers that
+    // interpret it as Windows-1252, which would otherwise mangle UTF-8.
+    let reason_suffix = if reason.is_empty() {
+        String::new()
+    } else {
+        format!(" -- {reason}")
+    };
     format!(
-        "predictor[pred] tier={} risk={} used={} rate={} p50={} pE={:.2} stale={}{}",
-        p.tier,
-        p.risk,
-        pct,
-        rate,
-        p50,
-        prob,
-        stale,
-        // ASCII separator only — the diagnose log file is read by viewers that
-        // interpret it as Windows-1252, which would otherwise mangle UTF-8.
-        if reason.is_empty() {
-            String::new()
-        } else {
-            format!(" -- {reason}")
-        }
+        "predictor[pred] tier={} risk={} used={} rate={}{} p50={} pE={:.2} stale={} act={}{}{}",
+        p.tier, p.risk, pct, rate, frozen, p50, prob, stale, activity, hawkes, reason_suffix,
     )
 }
 

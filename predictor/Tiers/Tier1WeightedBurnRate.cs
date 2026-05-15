@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using ClaudeUsageProjector.Predictor.Activity;
+using ClaudeUsageProjector.Predictor.Hawkes;
 using ClaudeUsageProjector.Predictor.Projection;
 using ClaudeUsageProjector.Predictor.State;
 
@@ -21,10 +23,10 @@ namespace ClaudeUsageProjector.Predictor.Tiers;
 /// rate data or stale beyond unknown threshold.
 /// Staleness 5..15 min downgrades one level; &gt;15 min forces unknown.
 /// <para/>
-/// Ported from CSM (commit history at C:\Source\Claude Session Monitor\). The
-/// idle-freeze cache and Hawkes wire-up are deferred to Phase 3 when the JSONL
-/// activity adapter lands; until then activity is always unknown so the freeze
-/// branch never fires.
+/// Idle-freeze: when the activity signal reports Idle and the freshly-computed
+/// rate has decayed below half the most recent active-mode rate, return the
+/// cached active rate instead — projection then reflects "expected rate when
+/// the user resumes prompting" rather than collapsing toward zero.
 /// </summary>
 public sealed class Tier1WeightedBurnRate
 {
@@ -32,22 +34,38 @@ public sealed class Tier1WeightedBurnRate
     private const double MinSpanMinutes = 5.0;
     private const double ResetThresholdPercent = 10.0;
 
+    private const double IdleFreezeRatio = 0.5;
+    private const double IdleCacheTtlMinutes = 120.0;
+
     private const double Weight5 = 0.5;
     private const double Weight15 = 0.3;
     private const double Weight30 = 0.2;
 
     private readonly PredictorOptions _options;
     private readonly IProjectionEngine _projection;
+    private readonly IHawkesIntensityScaler? _hawkes;
 
-    public Tier1WeightedBurnRate(PredictorOptions options, IProjectionEngine projection)
+    private readonly object _cacheLock = new();
+    private double? _cachedActiveRate;
+    private DateTimeOffset? _cachedActiveRateAtUtc;
+
+    public Tier1WeightedBurnRate(PredictorOptions options, IProjectionEngine projection, IHawkesIntensityScaler? hawkes = null)
     {
         _options = options;
         _projection = projection;
+        _hawkes = hawkes;
     }
 
     public Tier1WeightedBurnRate() : this(new PredictorOptions(), new DeterministicProjectionEngine()) { }
 
     public PredictionResult Compute(IReadOnlyList<UsageSnapshot> recentSnapshots, DateTimeOffset now)
+        => Compute(recentSnapshots, ActivitySignal.Empty, Array.Empty<TelemetryEvent>(), now);
+
+    public PredictionResult Compute(
+        IReadOnlyList<UsageSnapshot> recentSnapshots,
+        ActivitySignal activity,
+        IReadOnlyList<TelemetryEvent> recentTelemetry,
+        DateTimeOffset now)
     {
         var thresholds = _options.Thresholds;
         var staleness = _options.Staleness;
@@ -57,16 +75,25 @@ public sealed class Tier1WeightedBurnRate
             .OrderBy(s => s.CapturedAtUtc)
             .ToList();
 
+        var hawkesResult = ComputeHawkesRatio(recentTelemetry, now);
+
         if (snaps.Count == 0)
         {
             return new PredictionResult
             {
                 ComputedAtUtc = now,
-                Tier = ResolveTier(_projection),
+                Tier = ResolveTier(_projection, hawkesResult),
                 Risk = RiskLevel.Unknown,
                 Stale = true,
                 Reason = "No snapshots in window",
-                Engine = _projection.GetType().Name
+                Engine = _projection.GetType().Name,
+                ActivityMode = activity.Mode.ToString(),
+                ActiveSessionCount = activity.ActiveSessionCount,
+                HawkesIntensityRatio = hawkesResult?.IntensityRatio,
+                HawkesMu = hawkesResult?.Parameters.Mu,
+                HawkesAlpha = hawkesResult?.Parameters.Alpha,
+                HawkesBeta = hawkesResult?.Parameters.Beta,
+                HawkesEventsConsidered = hawkesResult?.EventsConsidered,
             };
         }
 
@@ -89,7 +116,9 @@ public sealed class Tier1WeightedBurnRate
                 priorReason = "Rate seeded from prior session";
         }
 
-        var weighted = wlsCurrent ?? wlsPrior ?? WeightedAverage(rate5, rate15, rate30);
+        var rawWeighted = wlsCurrent ?? wlsPrior ?? WeightedAverage(rate5, rate15, rate30);
+
+        var (weighted, frozenFromIdle) = ApplyIdleFreeze(rawWeighted, activity, now);
 
         var sigmaEstimate = EstimateRateVolatility(currentSnaps, now);
         var sigma = sigmaEstimate ?? (weighted.HasValue ? weighted.Value * 0.5 : 0.0);
@@ -124,6 +153,8 @@ public sealed class Tier1WeightedBurnRate
         var stale = false;
         var risk = baseRisk;
         var reason = priorReason;
+        if (frozenFromIdle)
+            reason = "Rate frozen at last active value (currently between prompts)";
 
         if (ageMinutes > staleness.UnknownAfterMinutes)
         {
@@ -135,7 +166,7 @@ public sealed class Tier1WeightedBurnRate
         {
             risk = Downgrade(risk);
             stale = true;
-            reason = $"Snapshot {ageMinutes:F1}min old — risk downgraded";
+            reason = $"Snapshot {ageMinutes:F1}min old -- risk downgraded";
         }
         else if (!weighted.HasValue)
         {
@@ -149,7 +180,7 @@ public sealed class Tier1WeightedBurnRate
         return new PredictionResult
         {
             ComputedAtUtc = now,
-            Tier = ResolveTier(_projection),
+            Tier = ResolveTier(_projection, hawkesResult),
             Risk = risk,
             Stale = stale,
             Reason = reason,
@@ -164,15 +195,74 @@ public sealed class Tier1WeightedBurnRate
             ProjectedPercentAtRefresh = projection.ExpectedFinalPercent,
             ProjectedEmptyBeforeRefresh = projectedBeforeRefresh,
             Engine = projection.EngineName,
+            ActivityMode = activity.Mode.ToString(),
+            ActiveSessionCount = activity.ActiveSessionCount,
+            RateFrozenFromIdle = frozenFromIdle,
+            HawkesIntensityRatio = hawkesResult?.IntensityRatio,
+            HawkesMu = hawkesResult?.Parameters.Mu,
+            HawkesAlpha = hawkesResult?.Parameters.Alpha,
+            HawkesBeta = hawkesResult?.Parameters.Beta,
+            HawkesEventsConsidered = hawkesResult?.EventsConsidered,
         };
     }
 
-    private static int ResolveTier(IProjectionEngine engine) =>
-        engine is MonteCarloProjectionEngine ? 2 : 1;
+    private HawkesIntensityResult? ComputeHawkesRatio(IReadOnlyList<TelemetryEvent> recentTelemetry, DateTimeOffset now)
+    {
+        if (_hawkes is null) return null;
+        if (recentTelemetry is null || recentTelemetry.Count == 0) return null;
+        return _hawkes.ComputeRatio(recentTelemetry, now);
+    }
 
-    // Finds the last reset (downward jump >= ResetThresholdPercent) and splits
-    // the list there. Returns (current segment, prior segment). If no reset,
-    // current = all, prior = empty.
+    private (double? rate, bool frozen) ApplyIdleFreeze(double? computed, ActivitySignal activity, DateTimeOffset now)
+    {
+        lock (_cacheLock)
+        {
+            if (_cachedActiveRateAtUtc.HasValue &&
+                (now - _cachedActiveRateAtUtc.Value).TotalMinutes > IdleCacheTtlMinutes)
+            {
+                _cachedActiveRate = null;
+                _cachedActiveRateAtUtc = null;
+            }
+
+            if (activity.Mode == ActivityMode.Active && computed.HasValue && computed.Value > 0)
+            {
+                _cachedActiveRate = computed.Value;
+                _cachedActiveRateAtUtc = now;
+                return (computed, false);
+            }
+
+            if (activity.Mode == ActivityMode.Idle &&
+                _cachedActiveRate.HasValue &&
+                (!computed.HasValue || computed.Value < _cachedActiveRate.Value * IdleFreezeRatio))
+            {
+                return (_cachedActiveRate, true);
+            }
+
+            return (computed, false);
+        }
+    }
+
+    /// <summary>Test-only hook to reset the idle-rate cache.</summary>
+    internal void ResetIdleCache()
+    {
+        lock (_cacheLock)
+        {
+            _cachedActiveRate = null;
+            _cachedActiveRateAtUtc = null;
+        }
+    }
+
+    // Tier 1 = burn rate only, Tier 2 = Monte Carlo, Tier 3 = MC + Hawkes
+    // diagnostic recorded. Hawkes ratio is informational at this phase
+    // (not yet wired to scale rates).
+    private static int ResolveTier(IProjectionEngine engine, HawkesIntensityResult? hawkes)
+    {
+        var mc = engine is MonteCarloProjectionEngine;
+        if (mc && hawkes is not null) return 3;
+        if (mc) return 2;
+        return 1;
+    }
+
     private static (List<UsageSnapshot> current, List<UsageSnapshot> prior) SplitAtLastReset(
         IReadOnlyList<UsageSnapshot> snapshots)
     {
@@ -214,8 +304,6 @@ public sealed class Tier1WeightedBurnRate
         return Math.Sqrt(Math.Max(0, weightedVar));
     }
 
-    // Fits percent = a + b*t via WLS with exponential recency weights. Returns
-    // the slope b (%/min), clamped to 0, or null when data is insufficient.
     private static double? ComputeWlsRate(IReadOnlyList<UsageSnapshot> snapshots, DateTimeOffset now)
     {
         if (snapshots.Count < 2) return null;
