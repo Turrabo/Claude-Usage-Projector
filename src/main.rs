@@ -43,11 +43,15 @@ fn main() {
 
     // === CSM EXTENSIONS BEGIN ===
     csm::sidecar::init();
+    csm::popup::init();
+    csm::hover::start();
     // === CSM EXTENSIONS END ===
 
     window::run();
 
     // === CSM EXTENSIONS BEGIN ===
+    csm::hover::stop();
+    csm::popup::shutdown();
     csm::sidecar::shutdown();
     // === CSM EXTENSIONS END ===
 }

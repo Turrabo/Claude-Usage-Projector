@@ -115,8 +115,8 @@ fn spawn() -> Result<Sidecar, String> {
         .ok_or_else(|| "predictor stdout pipe missing".to_string())?;
 
     // Reader: dispatches each line by the "type" field. Prediction messages
-    // are formatted as a single diagnose line for Phase 2; the popup window
-    // (Phase 4) will subscribe to a richer channel.
+    // are formatted as a single diagnose line AND pushed into the shared
+    // prediction store so the hover popup can render the latest snapshot.
     thread::spawn(move || {
         let reader = BufReader::new(stdout);
         for line in reader.lines() {
@@ -127,7 +127,10 @@ fn spawn() -> Result<Sidecar, String> {
             match classify_message(&line) {
                 Some("prediction") => {
                     match serde_json::from_str::<crate::csm::ipc::PredictionMessage>(&line) {
-                        Ok(pred) => diagnose::log(format_prediction(&pred)),
+                        Ok(pred) => {
+                            diagnose::log(format_prediction(&pred));
+                            crate::csm::prediction_store::store().push(&pred);
+                        }
                         Err(err) => diagnose::log(format!(
                             "predictor(prediction parse failed) {err}: {line}"
                         )),
