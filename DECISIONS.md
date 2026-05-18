@@ -184,3 +184,34 @@ Add `Microsoft.Data.Sqlite` to `Predictor.csproj` and run the migration inside `
 - Single-file exe size grew from ~35 MB to ~36 MB. Acceptable.
 - Microsoft.Data.Sqlite is a soft regression of ADR-003's AOT-friendliness — its native dependency is not AOT-compatible the way pure managed code is. Phase 5 isn't on the AOT path today, but a future AOT switch would need to either drop the migrator or compile it as a separate tool. Acceptable for now.
 - The migration window is hard-coded to the last 14 days (`CsmSqliteMigrator.MigrationWindowDays`). Older CSM data is left in `csm.sqlite` untouched; it's outside the popup chart's current-session window anyway, so importing it would be wasted bytes.
+
+---
+
+## ADR-009: Companion badge window for on-screen risk + runout, additive to the upstream widget
+
+**Date:** 2026-05-18
+**Status:** Accepted
+
+### Context
+
+After Phase 4 shipped the hover-popup chart, the on-screen widget surface devoted its always-visible bars to current usage% and weekly%, with risk and projected-runout one hover away. The user identified that the priorities were inverted relative to the predecessor (CSM) — its primary user value was answering "am I going to run out, and when?", and the popup-on-hover model hid those two signals from at-a-glance. Three architectural paths were evaluated:
+
+(a) Patch upstream's render code (`src/window.rs`) to inline risk and runout into the existing widget. Rejected: any edit inside upstream's positioning + painting hot loop would conflict on every upstream layout change, compounding the maintenance cost of the sentinel discipline established in ADR-001 and ADR-007.
+
+(b) Revive the abandoned WinUI 3 widget with upstream's OAuth + polling ported into C#. Rejected as a full rewrite that would also throw away the Phase 2–3 predictor port and abandon the upstream-sync workflow that the fork architecture depends on.
+
+(c) An additive companion Win32 window pinned to the upstream widget, drawn entirely by our code.
+
+### Decision
+
+`src/csm/badge.rs` — a layered Win32 window pinned immediately to the LEFT of the upstream usage widget (preserving upstream's flush-right anchor against the system tray for the combined cluster), showing two text rows: current risk on top, projected runout local time below. Visual is a translucent rounded card with separate horizontal and vertical outer margins (`REF_CARD_MARGIN_H = 6`, `REF_CARD_MARGIN_V = 4` reference pixels), `REF_CARD_CORNER_RADIUS = 4`. The badge mirrors upstream's UpdateLayeredWindow + DIB rendering technique and uses the same Segoe UI FW_MEDIUM `sc(-12)` font so its text reads as a continuation of upstream's typography.
+
+The hover trigger for the existing Phase 4 popup moved from the upstream widget HWND onto the badge HWND — we own that HWND directly, so `src/csm/hover.rs` no longer has to walk `FindWindowExW` under `Shell_TrayWnd` on each poll tick.
+
+### Consequences
+
+- Zero modifications inside upstream's render or input code. The CSM EXTENSIONS sentinel block in `src/main.rs` gained one line each for `csm::badge::init()` / `csm::badge::shutdown()`; no other upstream files were touched by this work.
+- The pattern (own a sibling HWND, drive it from `prediction_store`, mirror upstream's rendering primitives) is now the reference template for any future "add X to the widget surface" feature. See `[[feedback-companion-window-over-upstream-patch]]` auto-memory.
+- Drag-by-bevel is preserved on upstream's existing internal left bevel — exactly where upstream's drag handler has always lived; this ADR adds no new drag surface.
+- An experiment in click-forwarding from the badge's leftmost bevel zone into upstream's drag handler (commits `75a6540` + `d712bd6`) was reverted in `424af2b` after hitting a Win32 `SetCapture` limitation: capture silently fails when the calling cursor isn't currently over the capturing window, leaving upstream's drag state mid-transition. A proper forwarding implementation would have to call `SetCapture` on the badge HWND, track the drag locally, and forward each `WM_MOUSEMOVE` + `WM_LBUTTONUP` to upstream synthetically — feasible but not worth the surface area for a polish feature.
+- `SetWindowRgn` is re-applied each 1-second tick, scaled from the upstream widget's measured height. DPI changes propagate without us calling `GetDpiForWindow` explicitly — the upstream widget's rect is the authoritative scale signal.

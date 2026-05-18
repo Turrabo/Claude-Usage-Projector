@@ -58,7 +58,7 @@ If you are reading this on a machine where MSVC **is** available, the simpler pa
 | 3 | ✅ shipped | Port **JSONL tail adapter** and **Tier 3 Hawkes** burst model; predictions become rhythm-aware |
 | 4 | ✅ shipped | **Hover popup window** with chart and risk-coloured projection (Win32 GDI, hover-poll-driven over the widget) |
 | 5 | ✅ shipped | **JSONL persistence + one-time CSM SQLite migration**: predictor writes every observation to history.jsonl, imports the predecessor's csm.sqlite truth-source rows on first run |
-| 6 | pending | Distribution polish: tag-triggered release packaging (zip on GitHub Releases) and verified-graceful first-launch paths. **Code-signing is explicitly out of scope** — releases are unsigned; SmartScreen "More info → Run anyway" is accepted. |
+| 6 | ✅ shipped | Distribution: tag-triggered release packaging — zip on GitHub Releases bundles both binaries plus a README explaining the Mark-of-the-Web unblock and the SmartScreen click-through. Code-signing is out of scope and not planned. |
 
 Completed phases live in `git log` and `DECISIONS.md`. Forward direction lives here. Do not retro-edit this table to add notes about completed work — those belong in commit messages and `DECISIONS.md`.
 
