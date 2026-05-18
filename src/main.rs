@@ -44,6 +44,7 @@ fn main() {
     // === CSM EXTENSIONS BEGIN ===
     csm::sidecar::init();
     csm::popup::init();
+    csm::badge::init();
     csm::hover::start();
     // === CSM EXTENSIONS END ===
 
@@ -51,6 +52,7 @@ fn main() {
 
     // === CSM EXTENSIONS BEGIN ===
     csm::hover::stop();
+    csm::badge::shutdown();
     csm::popup::shutdown();
     csm::sidecar::shutdown();
     // === CSM EXTENSIONS END ===
