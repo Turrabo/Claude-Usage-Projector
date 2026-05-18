@@ -51,6 +51,20 @@ const REF_LINE_H: i32 = 14;
 const REF_LINE_GAP: i32 = 4;
 const REF_FONT_HEIGHT: i32 = -12; // CreateFontW lfHeight, negative = cell height
 
+// Drag-handle hit zone on the badge's left edge. Derived from upstream's
+// own DIVIDER_HIT_ZONE constant in src/window.rs (LEFT_DIVIDER_W +
+// DIVIDER_RIGHT_MARGIN) — upstream extends the click target a few pixels
+// past the visible 3-px bevel for forgiveness, and we mirror that so the
+// two handles behave identically.
+const REF_DRAG_HIT_ZONE: i32 = REF_LEFT_DIVIDER_W + REF_DIVIDER_RIGHT_MARGIN;
+
+// Target x (in upstream's client coords, pre-DPI) for forwarded drag
+// clicks. = 1 px = the centre of upstream's 3-px visible bevel — derived
+// from REF_LEFT_DIVIDER_W rather than picked, so if upstream ever widens
+// its bevel this still lands in the middle. Sits comfortably inside
+// upstream's 0..sc(DIVIDER_HIT_ZONE) drag region.
+const REF_FORWARD_TARGET_X: i32 = REF_LEFT_DIVIDER_W / 2;
+
 const BADGE_CLASS_NAME: &str = "ClaudeUsageProjectorBadge";
 const WIDGET_CLASS_NAME: &str = "ClaudeCodeUsageMonitor";
 const TASKBAR_CLASS_NAME: &str = "Shell_TrayWnd";
@@ -217,6 +231,32 @@ unsafe extern "system" fn badge_wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        WM_LBUTTONDOWN => {
+            // Forward clicks landing in our left-edge drag-handle zone to
+            // upstream's drag handle. Upstream's own WM_LBUTTONDOWN handler
+            // calls SetCapture and then receives the subsequent mouse moves
+            // and the button-up directly — we only hand off the initial
+            // click, after which upstream owns the whole drag interaction.
+            let xy = lparam.0 as i32;
+            let click_x = (xy & 0xFFFF) as i16 as i32;
+            let click_y = ((xy >> 16) & 0xFFFF) as i16 as i32;
+            let scale = current_scale(hwnd);
+            let hit_zone = ((REF_DRAG_HIT_ZONE as f64) * scale).round() as i32;
+            if click_x < hit_zone {
+                if let Some(upstream) = find_widget_hwnd() {
+                    let target_x =
+                        ((REF_FORWARD_TARGET_X as f64) * scale).round() as i32;
+                    let new_lparam = make_lparam(target_x, click_y);
+                    let _ = ReleaseCapture();
+                    SendMessageW(upstream, WM_LBUTTONDOWN, wparam, LPARAM(new_lparam));
+                    diagnose::log(format!(
+                        "badge: drag click forwarded to upstream at x={target_x} y={click_y}"
+                    ));
+                    return LRESULT(0);
+                }
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_TIMER => {
             if wparam.0 == TICK_TIMER_ID {
                 tick(hwnd);
@@ -281,13 +321,11 @@ unsafe fn tick(hwnd: HWND) {
     }
 }
 
-unsafe fn find_widget_rect() -> Option<RECT> {
+unsafe fn find_widget_hwnd() -> Option<HWND> {
     let widget_class = wide(WIDGET_CLASS_NAME);
     let widget_class_pcwstr = PCWSTR::from_raw(widget_class.as_ptr());
     let taskbar_class = wide(TASKBAR_CLASS_NAME);
     let taskbar_class_pcwstr = PCWSTR::from_raw(taskbar_class.as_ptr());
-
-    let mut hwnd_found: Option<HWND> = None;
 
     // Common case: widget is reparented into the taskbar — FindWindowW only
     // walks top-level, so search the tray's children first.
@@ -297,25 +335,49 @@ unsafe fn find_widget_rect() -> Option<RECT> {
                 FindWindowExW(tray, HWND::default(), widget_class_pcwstr, PCWSTR::null())
             {
                 if !child.is_invalid() {
-                    hwnd_found = Some(child);
+                    return Some(child);
                 }
             }
         }
     }
 
     // Fallback: rare top-level mode (embedding into the taskbar failed).
-    if hwnd_found.is_none() {
-        if let Ok(top) = FindWindowW(widget_class_pcwstr, PCWSTR::null()) {
-            if !top.is_invalid() {
-                hwnd_found = Some(top);
-            }
+    if let Ok(top) = FindWindowW(widget_class_pcwstr, PCWSTR::null()) {
+        if !top.is_invalid() {
+            return Some(top);
         }
     }
+    None
+}
 
-    let hwnd = hwnd_found?;
+unsafe fn find_widget_rect() -> Option<RECT> {
+    let hwnd = find_widget_hwnd()?;
     let mut r = RECT::default();
     GetWindowRect(hwnd, &mut r).ok()?;
     Some(r)
+}
+
+/// Runtime DPI scale, derived from the badge's actual client height vs
+/// REF_WIDGET_HEIGHT. Matches the scaling factor used in `tick()` and
+/// `paint_content`, so the same `sc()` derivation chain feeds both layout
+/// and hit-testing.
+unsafe fn current_scale(hwnd: HWND) -> f64 {
+    let mut r = RECT::default();
+    if GetClientRect(hwnd, &mut r).is_ok() {
+        let h = (r.bottom - r.top).max(1);
+        h as f64 / REF_WIDGET_HEIGHT as f64
+    } else {
+        1.0
+    }
+}
+
+/// Pack two signed coordinates into a Win32 LPARAM (low 16 bits = x,
+/// high 16 bits = y). Each coordinate is treated as a 16-bit value, matching
+/// how Win32 unpacks mouse lparams.
+fn make_lparam(x: i32, y: i32) -> isize {
+    let xw = (x as i16) as u16 as u32;
+    let yw = (y as i16) as u16 as u32;
+    ((yw << 16) | xw) as i32 as isize
 }
 
 // ---------------- Painting ----------------
