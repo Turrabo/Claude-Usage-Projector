@@ -1,11 +1,15 @@
 // Companion badge window. A small layered Win32 window pinned immediately to
-// the right of the upstream usage widget, showing two lines at a glance:
+// the LEFT of the upstream usage widget, showing two lines at a glance:
 //   row 1: current risk (HIGH / MED / LOW / —)
 //   row 2: projected runout local time, or "—"
 //
 // The badge is the at-a-glance "am I going to run out, and when?" answer that
 // the popup chart deep-dives. Its left edge replicates upstream's 3-pixel
-// two-tone bevel so the two windows visually read as one piece.
+// two-tone bevel, so the combined cluster reads as one flush-right unit:
+// `[badge-bevel][badge content][upstream-bevel][upstream content][tray]` —
+// each section starts with its own left-edge handle. Placing the badge on
+// the LEFT side preserves upstream's flush-right positioning so its drag
+// clamp still aligns the unit correctly against the system tray.
 //
 // Architecture mirrors src/csm/popup.rs: a dedicated thread owns the HWND and
 // its message loop; show/hide/repaint are driven by a 1-second timer that
@@ -254,7 +258,10 @@ unsafe fn tick(hwnd: HWND) {
     let scale = widget_h as f64 / REF_WIDGET_HEIGHT as f64;
     let badge_w = ((REF_BADGE_WIDTH as f64) * scale).round() as i32;
     let badge_h = widget_h;
-    let badge_x = widget_rect.right;
+    // Sit immediately to the LEFT of the upstream widget so upstream's own
+    // flush-right positioning (which clamps its right edge to the system
+    // tray) still anchors the combined unit correctly.
+    let badge_x = widget_rect.left - badge_w;
     let badge_y = widget_rect.top;
 
     let _ = SetWindowPos(

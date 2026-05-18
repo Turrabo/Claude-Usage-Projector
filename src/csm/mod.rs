@@ -8,9 +8,11 @@
 // Phase 4 adds `popup`, `hover`, and `prediction_store` — a hover-over
 // projection chart and the shared prediction history that feeds it.
 //
-// `badge` is a companion always-on window pinned to the right of the upstream
+// `badge` is a companion always-on window pinned to the left of the upstream
 // widget, surfacing risk + projected runout time so the user doesn't have to
-// hover to see them. It also owns the hover trigger that opens the popup.
+// hover to see them. Sits left so upstream's flush-right anchor against the
+// system tray remains valid for the combined unit. It also owns the hover
+// trigger that opens the popup.
 
 pub mod badge;
 pub mod hover;
