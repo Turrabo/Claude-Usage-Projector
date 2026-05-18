@@ -45,9 +45,12 @@ use crate::theme;
 // badge tracks DPI without us calling GetDpiForWindow ourselves.
 const REF_WIDGET_HEIGHT: i32 = 46;
 const REF_CARD_WIDTH: i32 = 80;
-const REF_CARD_MARGIN: i32 = 6; // outer margin around the card on all sides
-const REF_CARD_CORNER_RADIUS: i32 = 6;
-const REF_BADGE_WIDTH: i32 = REF_CARD_WIDTH + 2 * REF_CARD_MARGIN;
+const REF_CARD_MARGIN_H: i32 = 6; // outer margin on left/right
+const REF_CARD_MARGIN_V: i32 = 4; // outer margin on top/bottom (tighter than H so the
+                                  // card fills more of the taskbar slot vertically,
+                                  // which in turn lets the text breathe inside it)
+const REF_CARD_CORNER_RADIUS: i32 = 4;
+const REF_BADGE_WIDTH: i32 = REF_CARD_WIDTH + 2 * REF_CARD_MARGIN_H;
 const REF_CARD_PAD_H: i32 = 8; // horizontal padding from card edge to text
 const REF_LINE_H: i32 = 14;
 const REF_LINE_GAP: i32 = 4;
@@ -281,13 +284,14 @@ unsafe fn tick(hwnd: HWND) {
     // hit-test-transparent — clicks pass through to the taskbar. SetWindowRgn
     // takes ownership of the HRGN; replacing it on each tick frees the old
     // one. We re-set every tick so DPI changes are picked up automatically.
-    let card_margin = ((REF_CARD_MARGIN as f64) * scale).round() as i32;
+    let margin_h = ((REF_CARD_MARGIN_H as f64) * scale).round() as i32;
+    let margin_v = ((REF_CARD_MARGIN_V as f64) * scale).round() as i32;
     let card_radius = ((REF_CARD_CORNER_RADIUS as f64) * scale).round() as i32;
     let region = CreateRoundRectRgn(
-        card_margin,
-        card_margin,
-        badge_w - card_margin + 1,
-        badge_h - card_margin + 1,
+        margin_h,
+        margin_v,
+        badge_w - margin_h + 1,
+        badge_h - margin_v + 1,
         card_radius * 2,
         card_radius * 2,
     );
@@ -474,7 +478,7 @@ unsafe fn paint_content(
 
     // Text region: inset by margin + inner padding on each side so text
     // never crowds the rounded card edge.
-    let inset_h = sc(REF_CARD_MARGIN) + sc(REF_CARD_PAD_H);
+    let inset_h = sc(REF_CARD_MARGIN_H) + sc(REF_CARD_PAD_H);
     let content_x = inset_h;
     let content_right = width - inset_h;
 
