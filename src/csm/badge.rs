@@ -1,26 +1,28 @@
 // Companion badge window. A small layered Win32 window pinned immediately to
 // the LEFT of the upstream usage widget, showing two lines at a glance:
-//   row 1: current risk (HIGH / MED / LOW / —)
+//   row 1: current risk (High / Med / Low / —)
 //   row 2: projected runout local time, or "—"
 //
 // The badge is the at-a-glance "am I going to run out, and when?" answer that
-// the popup chart deep-dives. Its left edge replicates upstream's 3-pixel
-// two-tone bevel, so the combined cluster reads as one flush-right unit:
-// `[badge-bevel][badge content][upstream-bevel][upstream content][tray]` —
-// each section starts with its own left-edge handle. Placing the badge on
-// the LEFT side preserves upstream's flush-right positioning so its drag
-// clamp still aligns the unit correctly against the system tray.
+// the popup chart deep-dives. The visible body is a translucent rounded card
+// with generous outer margin, so the content reads as a bounded chip on the
+// taskbar rather than free-floating text. The card sits to the LEFT of the
+// upstream widget; upstream's flush-right positioning against the system tray
+// remains valid for the cluster.
 //
 // Architecture mirrors src/csm/popup.rs: a dedicated thread owns the HWND and
 // its message loop; show/hide/repaint are driven by a 1-second timer that
 // also handles repositioning when the upstream widget moves (DPI changes,
 // taskbar layout changes, alignment switches).
 //
-// Visual parity with upstream is achieved by mirroring src/window.rs's
-// UpdateLayeredWindow + premultiplied-alpha DIB technique. Background pixels
-// go to alpha = 1 (barely visible but still hit-testable) and content pixels
-// to alpha = 255, which lets us keep CLEARTYPE_QUALITY sub-pixel font
-// rendering for crisp OS-native text on either light or dark themes.
+// Visual is achieved by mirroring src/window.rs's UpdateLayeredWindow + DIB
+// technique, with two adjustments for the rounded translucent card:
+//   1. SetWindowRgn clips the visible area to a rounded rectangle inset by
+//      the card margin, so the margin around the card is automatically
+//      transparent and hit-testable through to the taskbar.
+//   2. Post-process applies premultiplied alpha at CARD_ALPHA (~78%) to card
+//      backdrop pixels and full opacity to text pixels. Text font matches
+//      upstream's sc(-12) FW_MEDIUM Segoe UI.
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
@@ -42,14 +44,14 @@ use crate::theme;
 // scale is derived from the upstream widget's actual measured height so the
 // badge tracks DPI without us calling GetDpiForWindow ourselves.
 const REF_WIDGET_HEIGHT: i32 = 46;
-const REF_BADGE_WIDTH: i32 = 80;
-const REF_LEFT_DIVIDER_W: i32 = 3;
-const REF_DIVIDER_RIGHT_MARGIN: i32 = 10;
-const REF_RIGHT_PAD: i32 = 8;
-const REF_DIVIDER_H: i32 = 25;
+const REF_CARD_WIDTH: i32 = 80;
+const REF_CARD_MARGIN: i32 = 6; // outer margin around the card on all sides
+const REF_CARD_CORNER_RADIUS: i32 = 6;
+const REF_BADGE_WIDTH: i32 = REF_CARD_WIDTH + 2 * REF_CARD_MARGIN;
+const REF_CARD_PAD_H: i32 = 8; // horizontal padding from card edge to text
 const REF_LINE_H: i32 = 14;
 const REF_LINE_GAP: i32 = 4;
-const REF_FONT_HEIGHT: i32 = -12; // CreateFontW lfHeight, negative = cell height
+const REF_FONT_HEIGHT: i32 = -12; // matches upstream's sc(-12) Segoe UI font
 
 const BADGE_CLASS_NAME: &str = "ClaudeUsageProjectorBadge";
 const WIDGET_CLASS_NAME: &str = "ClaudeCodeUsageMonitor";
@@ -61,8 +63,14 @@ const TICK_INTERVAL_MS: u32 = 1_000;
 const WM_APP_TICK: u32 = WM_USER + 1;
 
 // COLORREF is 0x00BBGGRR (B in high byte, R in low byte).
-const COLOR_BG_DARK: u32 = 0x001C1C1C;
-const COLOR_BG_LIGHT: u32 = 0x00F3F3F3;
+//
+// Card backdrop colour — chosen to sit a tone off the taskbar background so
+// the chip has presence without harshly blocking it. The CARD_ALPHA blend
+// keeps the taskbar visible through the card for that "tinted chip" look.
+const COLOR_CARD_DARK: u32 = 0x002C2C2C; // slightly lighter than #1C1C1C dark taskbar
+const COLOR_CARD_LIGHT: u32 = 0x00DEDEDE; // slightly darker than #F3F3F3 light taskbar
+const CARD_ALPHA: u8 = 200; // ~78% opaque; rest blends with the taskbar
+
 const COLOR_TEXT_DIM_DARK: u32 = 0x00888888;
 const COLOR_TEXT_DIM_LIGHT: u32 = 0x00404040;
 
@@ -71,12 +79,6 @@ const COLOR_RISK_HIGH: u32 = 0x004B4BE5; // #E54B4B
 const COLOR_RISK_MED: u32 = 0x0000B3FF; // #FFB300
 const COLOR_RISK_LOW: u32 = 0x0050AF4C; // #4CAF50
 const COLOR_RISK_UNKNOWN: u32 = 0x009AA0A6;
-
-// Bevel tones — two strips matching upstream's left-edge handle.
-const COLOR_BEVEL_OUTER_DARK: u32 = 0x00505050; // RGB(80,80,80)
-const COLOR_BEVEL_INNER_DARK: u32 = 0x00282828; // RGB(40,40,40)
-const COLOR_BEVEL_OUTER_LIGHT: u32 = 0x00A0A0A0; // RGB(160,160,160)
-const COLOR_BEVEL_INNER_LIGHT: u32 = 0x00E6E6E6; // RGB(230,230,230)
 
 static BADGE_HWND: AtomicIsize = AtomicIsize::new(0);
 static INIT_DONE: OnceLock<()> = OnceLock::new();
@@ -274,6 +276,25 @@ unsafe fn tick(hwnd: HWND) {
         SWP_NOACTIVATE,
     );
 
+    // Clip the visible area to the rounded card shape. Pixels outside this
+    // region (i.e. the outer margin) are not drawn to the screen and are
+    // hit-test-transparent — clicks pass through to the taskbar. SetWindowRgn
+    // takes ownership of the HRGN; replacing it on each tick frees the old
+    // one. We re-set every tick so DPI changes are picked up automatically.
+    let card_margin = ((REF_CARD_MARGIN as f64) * scale).round() as i32;
+    let card_radius = ((REF_CARD_CORNER_RADIUS as f64) * scale).round() as i32;
+    let region = CreateRoundRectRgn(
+        card_margin,
+        card_margin,
+        badge_w - card_margin + 1,
+        badge_h - card_margin + 1,
+        card_radius * 2,
+        card_radius * 2,
+    );
+    if !region.is_invalid() {
+        let _ = SetWindowRgn(hwnd, region, BOOL(1));
+    }
+
     render_layered(hwnd, badge_w, badge_h, scale);
 
     if !IsWindowVisible(hwnd).as_bool() {
@@ -331,7 +352,11 @@ fn risk_color(risk: &str) -> u32 {
 
 unsafe fn render_layered(hwnd: HWND, width: i32, height: i32, scale: f64) {
     let is_dark = theme::is_dark_mode();
-    let bg_color = if is_dark { COLOR_BG_DARK } else { COLOR_BG_LIGHT };
+    let card_color = if is_dark {
+        COLOR_CARD_DARK
+    } else {
+        COLOR_CARD_LIGHT
+    };
     let text_dim = if is_dark {
         COLOR_TEXT_DIM_DARK
     } else {
@@ -368,18 +393,24 @@ unsafe fn render_layered(hwnd: HWND, width: i32, height: i32, scale: f64) {
 
     let old_bmp = SelectObject(mem_dc, dib);
 
-    paint_content(mem_dc, width, height, scale, is_dark, bg_color, text_dim, &latest);
+    paint_content(mem_dc, width, height, scale, card_color, text_dim, &latest);
 
-    // Premultiplied-alpha post-process matching src/window.rs render_layered:
-    // background pixels become barely-visible (alpha 1, still hit-testable),
-    // content pixels become fully opaque (preserves ClearType sub-pixel
-    // rendering colours).
+    // Post-process: every pixel currently has either the card backdrop
+    // colour (the sentinel we filled the DIB with) or a text colour drawn
+    // on top. Card pixels become translucent (premultiplied at CARD_ALPHA),
+    // text pixels become fully opaque. Pixels outside the rounded card area
+    // are also card-coloured but are clipped at display time by the
+    // SetWindowRgn applied in tick(), so they never reach the user.
+    let card_alpha = CARD_ALPHA as u32;
     let pixel_count = (width * height) as usize;
     let pixel_data = std::slice::from_raw_parts_mut(bits as *mut u32, pixel_count);
     for px in pixel_data.iter_mut() {
         let rgb = *px & 0x00FFFFFF;
-        if rgb == bg_color {
-            *px = 0x01000000;
+        if rgb == card_color {
+            let b = ((rgb & 0xFF) * card_alpha) / 255;
+            let g = (((rgb >> 8) & 0xFF) * card_alpha) / 255;
+            let r = (((rgb >> 16) & 0xFF) * card_alpha) / 255;
+            *px = (card_alpha << 24) | (r << 16) | (g << 8) | b;
         } else {
             *px = rgb | 0xFF000000;
         }
@@ -420,55 +451,32 @@ unsafe fn paint_content(
     width: i32,
     height: i32,
     scale: f64,
-    is_dark: bool,
-    bg_color: u32,
+    card_color: u32,
     text_dim: u32,
     latest: &Option<LatestPrediction>,
 ) {
     let sc = |v: i32| -> i32 { ((v as f64) * scale).round() as i32 };
 
-    // Solid background.
+    // Fill entire DIB with the card backdrop colour. The post-process
+    // discriminates these pixels by exact-match against `card_color`, so any
+    // anti-aliased text edges (blends of text colour with backdrop) won't
+    // collide. The SetWindowRgn in tick() clips off the outer margin at
+    // display time, so margin pixels never appear on screen.
     let full = RECT {
         left: 0,
         top: 0,
         right: width,
         bottom: height,
     };
-    let bg_brush = CreateSolidBrush(COLORREF(bg_color));
-    FillRect(hdc, &full, bg_brush);
-    let _ = DeleteObject(bg_brush);
+    let card_brush = CreateSolidBrush(COLORREF(card_color));
+    FillRect(hdc, &full, card_brush);
+    let _ = DeleteObject(card_brush);
 
-    // Left bevel — two-tone strip mirroring src/window.rs:1346-1381.
-    let divider_h = sc(REF_DIVIDER_H);
-    let divider_top = (height - divider_h) / 2;
-    let divider_bottom = divider_top + divider_h;
-    let (bevel_outer, bevel_inner) = if is_dark {
-        (COLOR_BEVEL_OUTER_DARK, COLOR_BEVEL_INNER_DARK)
-    } else {
-        (COLOR_BEVEL_OUTER_LIGHT, COLOR_BEVEL_INNER_LIGHT)
-    };
-    let outer_brush = CreateSolidBrush(COLORREF(bevel_outer));
-    let outer_rect = RECT {
-        left: 0,
-        top: divider_top,
-        right: sc(2),
-        bottom: divider_bottom,
-    };
-    FillRect(hdc, &outer_rect, outer_brush);
-    let _ = DeleteObject(outer_brush);
-    let inner_brush = CreateSolidBrush(COLORREF(bevel_inner));
-    let inner_rect = RECT {
-        left: sc(2),
-        top: divider_top,
-        right: sc(3),
-        bottom: divider_bottom,
-    };
-    FillRect(hdc, &inner_rect, inner_brush);
-    let _ = DeleteObject(inner_brush);
-
-    // Text region.
-    let content_x = sc(REF_LEFT_DIVIDER_W) + sc(REF_DIVIDER_RIGHT_MARGIN);
-    let content_right = width - sc(REF_RIGHT_PAD);
+    // Text region: inset by margin + inner padding on each side so text
+    // never crowds the rounded card edge.
+    let inset_h = sc(REF_CARD_MARGIN) + sc(REF_CARD_PAD_H);
+    let content_x = inset_h;
+    let content_right = width - inset_h;
 
     let font_name = wide("Segoe UI");
     let font_height = ((REF_FONT_HEIGHT as f64) * scale).round() as i32;
@@ -491,19 +499,24 @@ unsafe fn paint_content(
     let old_font = SelectObject(hdc, font);
     let _ = SetBkMode(hdc, TRANSPARENT);
 
-    // Two rows centred vertically.
+    // Two rows centred vertically in the full window height. The card area
+    // is also vertically centred by symmetric margins, so this places the
+    // text in the middle of the visible card.
     let line_h = sc(REF_LINE_H);
     let gap = sc(REF_LINE_GAP);
     let total_h = line_h * 2 + gap;
     let row1_y = (height - total_h) / 2;
     let row2_y = row1_y + line_h + gap;
 
+    // Risk labels use title-case ("High" / "Med" / "Low") rather than ALL
+    // CAPS so the visual weight matches upstream's mixed-case text style at
+    // the same font height.
     let (risk_label, line_color) = match latest {
         Some(p) => {
             let label = match p.risk.as_str() {
-                "high" => "HIGH",
-                "medium" => "MED",
-                "low" => "LOW",
+                "high" => "High",
+                "medium" => "Med",
+                "low" => "Low",
                 _ => "—",
             };
             (label.to_string(), risk_color(&p.risk))
