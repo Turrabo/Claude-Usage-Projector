@@ -16,15 +16,30 @@ Six small testable steps. Order is roughly dependency-driven; some can run in pa
 
 Predictor refactor only. No UI change, no sync. The widget should still look single-account afterwards because only the active account on the local machine is producing data.
 
-- Bump IPC `v: 1 → v: 2` on both `predictor/Ipc/Messages.cs` and `src/csm/ipc.rs`.
-- Add `account_id` field on `ObserveMessage` and `PredictionMessage`.
-- New module: `predictor/Auth/ActiveAccount.cs` — reads `~/.claude/credentials.json`, decodes the JWT's `sub` claim (no signature validation; we trust the file as the local source of truth), produces a stable `account_id = "acct_" + sha256(sub).hex[:12]`. FileSystemWatcher fires on changes; the active-account ref is updated in-process.
-- Predictor state: refactor `ObservationWindow`, `TelemetryWindow`, prediction history etc. into `Dictionary<AccountId, …>`. All Tier 1/2/3 computations run per-account.
-- Existing `history.jsonl` is loaded under the currently-active account on startup (lossy but correct migration — see 7b for the proper migration).
-- Host: `src/csm/ipc.rs` updated to the new field; `src/csm/prediction_store.rs` becomes a `HashMap<String, …>` keyed by account.
-- Acceptance: launch the widget, run `claude login` to switch accounts, observe in the diagnose log that observations get attributed to the new `account_id` within a few seconds.
+Originally scoped as one sub-milestone; split during implementation into three commits for review cadence:
 
-Estimated effort: 2–3 days.
+**7a.foundation (shipped, commit `57fedbf`)** — IPC v:2 + active-account detection.
+- IPC bumped `v: 1 → v: 2` on both `predictor/Ipc/Messages.cs` and `src/csm/ipc.rs`.
+- `account_id` field added to `ObserveMessage` (host→predictor) and `PredictionMessage` (predictor→host).
+- New module `src/csm/account_id.rs` derives a stable opaque `account_id = "acct_" + sha256(jwt.sub).hex[:12]` from `~/.claude/credentials.json`. Reads on demand and caches by file mtime; no FileSystemWatcher (deferred — credentials are re-read every poll cycle naturally).
+- `EXPECTED_PREDICTOR_VERSION` bumped 0.5.0 → 0.6.0 so the existing version-handshake catches v:1↔v:2 stale pairings (commit `08e52f2` introduced the handshake).
+- `sha2` crate added to `Cargo.toml`; base64url decode is hand-rolled in `src/csm/account_id.rs` so we didn't pull in a second crate.
+
+**7a.3 (shipped, commit `b15e011`)** — per-account state in the predictor.
+- `predictor/Program.cs`: `ObservationWindow` and `Tier1WeightedBurnRate` are now both `Dictionary<AccountId, …>`, lazily populated. Each account gets its own Tier1 instance because the idle-rate cache is internal and stateful — sharing across accounts would smear one account's frozen rate onto another's prediction (caught by Checkpoint 2 reviewer A).
+- `TelemetryWindow`, `JsonlActivityDetector`, `MonteCarloProjectionEngine`, `DefaultHawkesIntensityScaler` remain shared (machine-scoped per ADR-011's JsonlTail carve-out).
+- Predictor emits the active `account_id` on every `PredictionMessage`. Backfill at startup goes to sentinel `acct_default`.
+- Host's `format_prediction` log line now includes `acct=…` so the diagnose log shows routing.
+
+**7a.4 (pending)** — host-side `prediction_store` keyed by account.
+- `src/csm/prediction_store.rs` is still a single global `OnceLock<PredictionStore>` with `latest: Option<LatestPrediction>` and one `VecDeque<HistoryEntry>`. Today's predictor emits `account_id` on every message but the host discards it — `PredictionMessage`s arriving from different accounts overwrite each other's `latest` and interleave in `history`.
+- For 7a.4: refactor `PredictionStore` to `HashMap<AccountId, AccountState>` where each `AccountState` holds its own `latest + history`. `badge.rs` and `popup.rs` continue to read the *active* account only (UI change comes in 7c); this commit is plumbing-only.
+- Existing `LatestPrediction` and `HistoryEntry` structs are unchanged; only the container shape changes.
+- Estimated effort: ~half a day. Naturally pairs with a third reviewer-checkpoint pass before push.
+
+**Acceptance for 7a as a whole** (after 7a.4 lands): launch the widget, run `claude login` to switch accounts on a single machine, observe in the diagnose log that observations get attributed to the new `account_id` within a few seconds AND that the badge/popup keep showing the active account's data without seeing the older account's stale projection bleed through.
+
+Estimated effort remaining: half a day for 7a.4.
 
 ### 7b — Persistence sharding + one-time migration
 
