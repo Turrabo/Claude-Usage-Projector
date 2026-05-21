@@ -30,12 +30,33 @@ using ClaudeUsageProjector.Predictor.Tiers;
 
 PersistencePaths.EnsureRootExists();
 
-var snapshots = new ObservationWindow();
+// Phase 7a.3: per-account state. Each observation routes by `account_id`
+// (from IPC v:2). The window AND the Tier1 engine are both per-account
+// (lazy-created on first observe) because Tier1WeightedBurnRate holds an
+// idle-rate cache internally — sharing one instance across accounts
+// would smear account A's frozen rate onto account B's prediction. See
+// DECISIONS.md ADR-011 for the model.
+//
+// TelemetryWindow + JsonlActivityDetector + the Hawkes scaler stay
+// shared across accounts: they reflect this machine's session-timing
+// data, which ADR-011 explicitly keeps machine-scoped (JsonlTail events
+// aren't account-tagged on disk). MonteCarloProjectionEngine is shared
+// because it's effectively stateless — only its internal Random is
+// reused, and the predictor's IPC loop is single-threaded so calls
+// serialise naturally.
+var snapshotsByAccount = new Dictionary<string, ObservationWindow>();
+var tiersByAccount = new Dictionary<string, Tier1WeightedBurnRate>();
 var telemetry = new TelemetryWindow();
 var activityDetector = new JsonlActivityDetector();
 var monteCarlo = new MonteCarloProjectionEngine();
 var hawkesScaler = new DefaultHawkesIntensityScaler();
-var tier = new Tier1WeightedBurnRate(new PredictorOptions(), monteCarlo, hawkesScaler);
+var predictorOptions = new PredictorOptions();
+
+// Sentinel for observations that arrive without an account_id (v:1 host
+// paired with v:2 predictor, or the host couldn't read credentials.json).
+// On startup we also load all pre-v:2 persisted history under this id;
+// Phase 7b will migrate it to per-account shards via a tagged rewrite.
+const string DefaultAccountId = "acct_default";
 
 var historyWriter = new HistoryJsonlWriter();
 
@@ -48,19 +69,27 @@ if (migrated is int m && m > 0)
 }
 
 // Restore the in-memory window from disk so the popup chart survives reboots.
+// Phase 7a.3: all persisted rows go under DefaultAccountId because the
+// flat history.jsonl format pre-dates per-account sharding. The next
+// observe with a real account_id will create that account's own window
+// and live data accrues there. Backfill predictions thus tag as
+// DefaultAccountId — the host's prediction_store currently doesn't key
+// by account so this is a no-op for UI today; Phase 7a.4 / 7c will fix.
 var reader = new HistoryJsonlReader();
 var persisted = reader.LoadAll(out var skipped);
 if (persisted.Count > 0)
 {
-    snapshots.Seed(persisted, DateTimeOffset.UtcNow);
-    Log("info", $"persistence: loaded {persisted.Count} snapshots (skipped {skipped} malformed)");
+    var defaultSnapshots = new ObservationWindow();
+    defaultSnapshots.Seed(persisted, DateTimeOffset.UtcNow);
+    snapshotsByAccount[DefaultAccountId] = defaultSnapshots;
+    Log("info", $"persistence: loaded {persisted.Count} snapshots (skipped {skipped} malformed) into {DefaultAccountId}");
 
     // Replay loaded snapshots to the host as tier=0 ("backfill") prediction
     // messages so the popup's history line is populated immediately on a
     // fresh launch. The host's prediction_store sees tier=0 and pushes only
     // to history, leaving `latest` untouched for the live prediction that
     // arrives on the next observe.
-    foreach (var s in snapshots.Snapshots)
+    foreach (var s in defaultSnapshots.Snapshots)
     {
         if (!s.UsedPercent.HasValue) continue;
         var backfill = new PredictionMessage
@@ -72,6 +101,7 @@ if (persisted.Count > 0)
             UsedPercent = s.UsedPercent,
             RefreshAtUtc = s.RefreshAtUtc is { } r ? FormatUtc(r) : null,
             ProbabilityEmptyBeforeRefresh = 0.0,
+            AccountId = DefaultAccountId,
         };
         var backfillLine = JsonSerializer.Serialize(backfill, IpcJsonContext.Default.PredictionMessage);
         Console.Out.WriteLine(backfillLine);
@@ -122,7 +152,7 @@ while ((line = Console.In.ReadLine()) is not null)
         switch (messageType)
         {
             case "observe":
-                HandleObserve(line, snapshots, telemetry, activityDetector, tier, historyWriter);
+                HandleObserve(line, snapshotsByAccount, tiersByAccount, predictorOptions, monteCarlo, hawkesScaler, telemetry, activityDetector, historyWriter);
                 break;
             case "shutdown":
                 Log("info", "shutdown received");
@@ -144,10 +174,13 @@ return;
 
 static void HandleObserve(
     string rawLine,
-    ObservationWindow snapshots,
+    Dictionary<string, ObservationWindow> snapshotsByAccount,
+    Dictionary<string, Tier1WeightedBurnRate> tiersByAccount,
+    PredictorOptions predictorOptions,
+    MonteCarloProjectionEngine monteCarlo,
+    IHawkesIntensityScaler hawkesScaler,
     TelemetryWindow telemetry,
     IActivityDetector detector,
-    Tier1WeightedBurnRate tier,
     HistoryJsonlWriter writer)
 {
     ObserveMessage? observe;
@@ -180,12 +213,30 @@ static void HandleObserve(
     var cx = observe.Codex is null
         ? "cx=none"
         : $"cx 5h={observe.Codex.FiveHourPct:0.0}% 7d={observe.Codex.SevenDayPct:0.0}%";
-    // Phase 7a foundation: account_id is logged but not yet routed. State
-    // refactor to per-account windows lands in Phase 7a.3+.
-    var acct = observe.AccountId is null ? "acct=?" : $"acct={observe.AccountId}";
+    // Phase 7a.3: route observations to per-account windows. Missing
+    // account_id (v:1 host or unreadable credentials) routes to a
+    // sentinel "acct_default" so we never drop data.
+    const string DefaultAccountId = "acct_default";
+    var accountId = observe.AccountId ?? DefaultAccountId;
+    var acct = $"acct={accountId}";
     Log("info", $"observed @ {observe.TimestampUtc}  {acct}  {cc}  {cx}");
 
     if (observe.ClaudeCode is null) return;
+
+    if (!snapshotsByAccount.TryGetValue(accountId, out var snapshots))
+    {
+        snapshots = new ObservationWindow();
+        snapshotsByAccount[accountId] = snapshots;
+        Log("info", $"new account window: {accountId}");
+    }
+    if (!tiersByAccount.TryGetValue(accountId, out var tier))
+    {
+        // Per-account Tier1 instance — its internal idle-rate cache
+        // must not be shared across accounts (otherwise account A's
+        // frozen rate would smear onto B's projection).
+        tier = new Tier1WeightedBurnRate(predictorOptions, monteCarlo, hawkesScaler);
+        tiersByAccount[accountId] = tier;
+    }
 
     DateTimeOffset? refreshAt = null;
     if (!string.IsNullOrEmpty(observe.ClaudeCode.ResetsAtUtc)
@@ -213,14 +264,15 @@ static void HandleObserve(
     var telemetrySnapshot = telemetry.Snapshot();
     var activity = detector.Detect(telemetrySnapshot, capturedAt);
     var result = tier.Compute(snapshots.Snapshots, activity, telemetrySnapshot, capturedAt);
-    EmitPrediction(result);
+    EmitPrediction(result, accountId);
 }
 
-static void EmitPrediction(PredictionResult r)
+static void EmitPrediction(PredictionResult r, string accountId)
 {
     var message = new PredictionMessage
     {
         TimestampUtc = FormatUtc(r.ComputedAtUtc),
+        AccountId = accountId,
         Tier = r.Tier,
         Risk = r.Risk.ToString().ToLowerInvariant(),
         Reason = r.Reason,

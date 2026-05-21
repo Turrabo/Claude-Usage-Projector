@@ -231,6 +231,7 @@ fn classify_message(line: &str) -> Option<&str> {
 }
 
 fn format_prediction(p: &crate::csm::ipc::PredictionMessage) -> String {
+    let acct = p.account_id.as_deref().unwrap_or("?");
     let pct = p
         .used_pct
         .map(|v| format!("{v:.1}%"))
@@ -264,8 +265,8 @@ fn format_prediction(p: &crate::csm::ipc::PredictionMessage) -> String {
         format!(" -- {reason}")
     };
     format!(
-        "predictor[pred] tier={} risk={} used={} rate={}{} p50={} pE={:.2} stale={} act={}{}{}",
-        p.tier, p.risk, pct, rate, frozen, p50, prob, stale, activity, hawkes, reason_suffix,
+        "predictor[pred] acct={} tier={} risk={} used={} rate={}{} p50={} pE={:.2} stale={} act={}{}{}",
+        acct, p.tier, p.risk, pct, rate, frozen, p50, prob, stale, activity, hawkes, reason_suffix,
     )
 }
 
