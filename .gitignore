@@ -1,6 +1,11 @@
 # Rust build artifacts
 /target/
 
+# xwin's default cache location when --output isn't passed. The cargo-xwin
+# pipeline keeps its real cache at %LOCALAPPDATA%\cargo-xwin\, but a bare
+# `xwin splat` from this directory would drop one here.
+/.xwin-cache/
+
 # .NET predictor build artifacts (fork-specific). Glob form so the sub-project
 # under predictor/Predictor.Tests/ is also covered.
 /predictor/**/bin/

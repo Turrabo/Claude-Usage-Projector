@@ -2,13 +2,14 @@
 
 There are two binaries: `ccum-host.exe` (Rust) and `ccum-predictor.exe` (C# / .NET 9). They are designed to live side-by-side in the same folder at runtime. The host spawns the predictor as a child process; if the predictor isn't co-located the host runs fine but the sidecar is a silent no-op.
 
-This guide covers three workflows:
+This guide covers four workflows:
 
 1. [Building on a machine with MSVC available](#standard-msvc-path) — the simple path
-2. [Building locally without MSVC](#no-msvc-corporate-machine-path) — for the corporate-machine block we hit (see [DECISIONS.md ADR-003 and ADR-005](../DECISIONS.md))
-3. [Using CI-built artifacts](#ci-artifact-path) — fastest path when local builds aren't an option
+2. [Building locally without MSVC via cargo-xwin](#no-msvc-runnable-cargo-xwin-path) — runnable local binaries on a machine that can't install MSVC Build Tools (the main developer machine)
+3. [Building locally without MSVC via gnullvm](#no-msvc-compile-check-gnullvm-path) — compile-check only, kept as a fallback (the binary doesn't launch — see ADR-005)
+4. [Using CI-built artifacts](#ci-artifact-path) — when neither local path applies, or for clean reproducible builds
 
-If you are not the project maintainer on the specific machine where it was set up, you almost certainly want path (1) or (3).
+If you are not the project maintainer on the specific machine where it was set up, you almost certainly want path (1) or (4).
 
 ---
 
@@ -48,11 +49,60 @@ The widget should appear in your taskbar. Add `--diagnose` to log to `%TEMP%\cla
 
 ---
 
-## No-MSVC (corporate machine) path
+## No-MSVC runnable (cargo-xwin) path
 
-If `Microsoft.VisualStudio.2022.BuildTools` cannot be installed on your machine (corporate IT block, AV interference, or any other reason — symptoms: the bootstrapper runs and downloads dependencies but the `Microsoft.VC.Tools.*` payload never lands, `vswhere` reports no installations), use this path instead.
+If `Microsoft.VisualStudio.2022.BuildTools` cannot be installed on your machine (corporate IT block, AV interference, or any other reason — symptoms: the bootstrapper runs and downloads dependencies but the `Microsoft.VC.Tools.*` payload never lands, `vswhere` reports no installations), use this path. It produces a **runnable** MSVC-target binary in ~10s incremental, ~30s clean — same as `cargo build --release` would on a machine with MSVC installed.
 
-**Read first**: [DECISIONS.md ADR-005](../DECISIONS.md) for why we have this workaround at all. The local host binary you build this way **compiles but does not launch correctly** — see [the gnullvm runtime bug section below](#known-limitation-gnullvm-binary-doesnt-launch). Use this path for compile-checks, type-checking, and lint passes only. For runnable host binaries, use the [CI artifact path](#ci-artifact-path).
+The trick: `cargo-xwin` downloads the MSVC SDK headers + libraries directly from Microsoft's CDN as raw files (bypassing the installer bootstrapper that the corporate block typically targets) and uses LLVM-MinGW's `lld` as the linker. The CDN raw-file downloads pass through the same network controls that allow normal HTTPS to Microsoft from a browser.
+
+**Prerequisites**
+
+- Windows 10/11 with admin-on-demand (UAC) available
+- Rust + LLVM-MinGW already installed (same as the gnullvm path below)
+- The Rust gnullvm toolchain with the msvc target added:
+  ```powershell
+  rustup target add x86_64-pc-windows-msvc --toolchain stable-x86_64-pc-windows-gnullvm
+  ```
+- `xwin` and `cargo-xwin` installed via the gnullvm toolchain (because installing under msvc fails without link.exe):
+  ```powershell
+  cargo +stable-x86_64-pc-windows-gnullvm install --locked --target x86_64-pc-windows-gnullvm xwin
+  cargo +stable-x86_64-pc-windows-gnullvm install --locked --target x86_64-pc-windows-gnullvm cargo-xwin
+  ```
+- The MSVC SDK populated into cargo-xwin's cache. This step is **one-time** and needs admin (UAC) to create one version-pointer symlink inside the SDK directory:
+  ```powershell
+  # In an ELEVATED PowerShell, once per machine:
+  xwin --accept-license splat --output "$env:LOCALAPPDATA\cargo-xwin\xwin"
+  ```
+
+**Build**
+
+```powershell
+./tools/dev-build-msvc.ps1
+# Produces target/x86_64-pc-windows-msvc/release/claude-code-usage-monitor.exe (~0.82 MB, runnable)
+```
+
+The script handles three things the bare `cargo xwin build` invocation doesn't:
+- Creates an `lld-link.exe` shim in `~/.cargo/bin` (LLVM-MinGW ships `ld.lld.exe` but Rust's msvc target expects `lld-link.exe` — same binary, different driver-mode name)
+- Adds LLVM-MinGW to `PATH` so cargo-xwin's `--cross-compiler clang` finds clang
+- Sets `SKIP_WINRES=1` so `build.rs` skips the icon + version-metadata embed (which needs Microsoft's `rc.exe`, not in the xwin SDK)
+
+**Build the predictor**
+
+Unaffected by the MSVC block. Same command as the standard path:
+
+```powershell
+dotnet publish predictor/Predictor.csproj -c Release -r win-x64 --self-contained true /p:PublishSingleFile=true
+```
+
+**Run**
+
+Pair the host with any recent `ccum-predictor.exe` (a CI artifact works fine if you don't want to rebuild the predictor each time) and launch with `--diagnose`. The widget should appear in the taskbar identically to a CI-built binary.
+
+---
+
+## No-MSVC compile-check (gnullvm) path
+
+This is the older fallback. The binary compiles successfully but **does not launch correctly** (silently exits ~5s after startup — see [DECISIONS.md ADR-005](../DECISIONS.md) and [the gnullvm runtime bug section below](#known-limitation-gnullvm-binary-doesnt-launch)). Useful for `cargo check`, `cargo clippy`, and editor type-checking when you don't want to invoke the full cargo-xwin pipeline. For runnable binaries, use the cargo-xwin path above.
 
 **Prerequisites**
 

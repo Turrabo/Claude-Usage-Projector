@@ -3,6 +3,14 @@ use winres::{VersionInfo, WindowsResource};
 fn main() {
     let version = env!("CARGO_PKG_VERSION");
 
+    // SKIP_WINRES escape hatch for local cross-compile builds where Microsoft's
+    // rc.exe isn't available (e.g. `cargo xwin build` on a machine without the
+    // full Windows SDK installed). Skipping just drops the embedded icon and
+    // PE version metadata — the resulting .exe still runs identically.
+    if std::env::var_os("SKIP_WINRES").is_some() {
+        return;
+    }
+
     // Embed the icon and richer PE version metadata into the executable.
     let mut res = WindowsResource::new();
     let numeric_version = pack_version(version);

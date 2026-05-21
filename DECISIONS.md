@@ -215,3 +215,38 @@ The hover trigger for the existing Phase 4 popup moved from the upstream widget 
 - Drag-by-bevel is preserved on upstream's existing internal left bevel — exactly where upstream's drag handler has always lived; this ADR adds no new drag surface.
 - An experiment in click-forwarding from the badge's leftmost bevel zone into upstream's drag handler (commits `75a6540` + `d712bd6`) was reverted in `424af2b` after hitting a Win32 `SetCapture` limitation: capture silently fails when the calling cursor isn't currently over the capturing window, leaving upstream's drag state mid-transition. A proper forwarding implementation would have to call `SetCapture` on the badge HWND, track the drag locally, and forward each `WM_MOUSEMOVE` + `WM_LBUTTONUP` to upstream synthetically — feasible but not worth the surface area for a polish feature.
 - `SetWindowRgn` is re-applied each 1-second tick, scaled from the upstream widget's measured height. DPI changes propagate without us calling `GetDpiForWindow` explicitly — the upstream widget's rect is the authoritative scale signal.
+
+---
+
+## ADR-010: cargo-xwin for runnable local builds on the MSVC-blocked machine
+
+**Date:** 2026-05-21
+**Status:** Accepted — partial supersession of ADR-005 for runnable binaries; ADR-005's gnullvm path remains as the compile-check-only fallback.
+
+### Context
+
+ADR-005 set up `gnullvm` + LLVM-MinGW as the local Rust build path on a machine that can't install MSVC C++ Build Tools. The compromise: the gnullvm binary compiles successfully but silently exits ~5s after startup at runtime, so iteration requires pushing to CI and waiting ~4 min for a downloadable artifact. After ~6 weeks of using that loop, the cost became the main practical drag on development velocity.
+
+Two paths were explored to fix it:
+
+(a) WSL2 + cross-compile via `cargo-xwin` inside Linux. Failed: the corporate network blocks WSL2's NAT outbound traffic (DNS resolves but no HTTP/HTTPS to any external host), and `networkingMode=mirrored` left WSL unable to start. Reverted.
+
+(b) Windows-native `cargo-xwin`. cargo-xwin downloads the MSVC SDK headers + import libraries directly from Microsoft's CDN as raw files, bypassing the installer bootstrapper that the corporate IT block targets. The CDN raw-file URLs pass through the same network controls that allow HTTPS to Microsoft from a browser. Combined with LLVM-MinGW's existing LLD installation (already there for the gnullvm path), this gives us a complete MSVC-target build pipeline without needing `link.exe`.
+
+### Decision
+
+`tools/dev-build-msvc.ps1` invokes `cargo xwin build --target x86_64-pc-windows-msvc --cross-compiler clang` with three pieces of glue:
+
+- An `lld-link.exe` shim in `~/.cargo/bin` — LLVM-MinGW ships `ld.lld.exe` (the GNU/MinGW driver name) but the msvc target expects `lld-link.exe` (the MSVC driver name). Same underlying LLD binary, mode picked by program name; we just `Copy-Item` it once.
+- LLVM-MinGW's `bin` on `PATH` so cargo-xwin's clang invocation finds the compiler.
+- `SKIP_WINRES=1` env var that tells `build.rs` to skip the Win32 resource embed (icon + version metadata). That embed needs Microsoft's `rc.exe` which isn't part of the xwin SDK download. The resulting `.exe` still runs identically — only the embedded metadata is missing, which is irrelevant for dev iteration.
+
+One-time admin setup populates the SDK cache: `xwin --accept-license splat --output "$env:LOCALAPPDATA\cargo-xwin\xwin"` from an elevated shell creates the cache directory's version-pointer symlink (the one symlink that needs admin even though we have admin-on-demand, because Developer Mode is also blocked on this machine). After that, all subsequent builds run non-elevated.
+
+### Consequences
+
+- Local iteration loop drops from ~4 min (push → CI → download) to ~10s (`cargo xwin build` incremental). For the 90% case of "tweaked a constant, want to see the result" this is the difference between an interactive workflow and a context-switch workflow.
+- The CI workflows are unchanged and remain the authoritative reproducible-build path. cargo-xwin output is byte-equivalent in behaviour but not in metadata (no embedded icon/version).
+- ADR-005's gnullvm path is kept as a compile-check fallback (`cargo check`/`clippy` against the gnullvm toolchain, which is faster than spinning up cargo-xwin for type-checking).
+- `winres = "0.1"` doesn't support `rc.exe` overrides directly; the `SKIP_WINRES` escape hatch in `build.rs` (~6 lines) is the cleanest workaround. A future upgrade to a more flexible resource-embed crate (e.g. `embed-resource`) could remove that hatch, but the current approach is low-overhead.
+- xwin caches the SDK at `%LOCALAPPDATA%\cargo-xwin\xwin\` — ~1 GB on disk. Cleanup with `Remove-Item -Recurse $env:LOCALAPPDATA\cargo-xwin` if it ever needs to be rebuilt.

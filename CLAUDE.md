@@ -41,11 +41,12 @@ A daily GitHub Actions workflow (`.github/workflows/upstream-sync.yml`) attempts
 
 The user's development machine has a corporate IT block that prevents installing MSVC C++ Build Tools. As a result:
 
-- **Local dev**: Rust GNU/gnullvm + LLVM-MinGW (via `tools/dev-build.ps1`) for compile-checks only. The resulting host binary doesn't launch correctly — see the gnullvm runtime bug in auto-memory and [`docs/BUILD.md`](docs/BUILD.md).
-- **Runnable binaries**: GitHub Actions on `windows-latest` (full MSVC pre-installed) — push a branch, download the `build-host` and `build-predictor` artifacts.
+- **Local runnable builds**: `tools/dev-build-msvc.ps1` invokes `cargo xwin build --target x86_64-pc-windows-msvc` with LLVM-MinGW's LLD as the linker. cargo-xwin pulls the MSVC SDK from Microsoft's CDN as raw files (bypassing the IT-blocked installer). Result: a fully runnable msvc-target binary in ~10s incremental. **This is the primary local-dev path.** See [`docs/BUILD.md`](docs/BUILD.md) and ADR-010 in [`DECISIONS.md`](DECISIONS.md).
+- **Compile-check only fallback**: Rust GNU/gnullvm + LLVM-MinGW (via `tools/dev-build.ps1`). Compiles successfully but the resulting binary silently exits ~5s after startup — useful for `cargo check`/`clippy` if you don't want to invoke the full cargo-xwin pipeline.
+- **CI runnable binaries**: GitHub Actions on `windows-latest` (full MSVC pre-installed) — push a branch, download the `build-host` and `build-predictor` artifacts. Same end product as `dev-build-msvc.ps1` produces locally.
 - **C# predictor local**: works locally with just the .NET 9 SDK; `dotnet publish -c Release -r win-x64 --self-contained true /p:PublishSingleFile=true` produces a ~35 MB single-file exe with no install prerequisite for end users.
 
-If you are reading this on a machine where MSVC **is** available, the simpler path is the upstream's `cargo build --release` and you can ignore most of the gnullvm machinery.
+If you are reading this on a machine where MSVC **is** available, the simpler path is the upstream's `cargo build --release` and you can ignore both the cargo-xwin and gnullvm machinery.
 
 ## Phase plan (forward-looking)
 
