@@ -31,7 +31,7 @@ See [`DECISIONS.md`](DECISIONS.md) for *why* it's two binaries, and [`docs/BUILD
 The fork is designed to absorb upstream changes with minimal conflict:
 
 - **All fork-authored code lives in new files**: `predictor/`, `src/csm/`, `tools/`, `docs/`, top-level docs
-- **Edits to upstream files are kept tiny and sentinel-marked** (`// === CSM EXTENSIONS BEGIN ===` / `// === CSM EXTENSIONS END ===`) — currently four sites: `src/main.rs` (module decl; sidecar/popup/badge/hover init; sidecar/badge/popup/hover shutdown — three sentinel blocks) and `src/poller.rs` (one-line observation hook)
+- **Edits to upstream files are kept tiny and sentinel-marked** (`// === CSM EXTENSIONS BEGIN ===` / `// === CSM EXTENSIONS END ===`) — currently four sites: `src/main.rs` (module decl; sidecar/popup/badge/hover init; sidecar/badge/popup/hover shutdown — three sentinel blocks) and `src/poller.rs` (two-line observation hook: derive active account_id, then record_observation)
 - **Upstream's `README.md` and `LICENSE` are not modified** — keep them as-is for clean fast-forwards from upstream
 - **One upstream file is fully replaced**: `.github/workflows/release.yml`. Upstream's submits to their WinGet package; ours bundles both binaries into a zip Release. Future upstream changes to that file will surface as a merge conflict, which is the intended divergence signal.
 

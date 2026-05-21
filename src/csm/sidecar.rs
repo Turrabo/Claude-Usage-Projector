@@ -40,7 +40,12 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 /// about missing predictions. Predictor's startup log line is:
 ///   "ccum-predictor v<X.Y.Z> started (pid=<n>)"
 /// — we parse the version out of that string.
-const EXPECTED_PREDICTOR_VERSION: &str = "0.5.0";
+///
+/// Bumped 0.5.0 → 0.6.0 alongside the IPC v:1 → v:2 protocol change in
+/// Phase 7a (see DECISIONS.md ADR-011). The version handshake's job is to
+/// catch wire-incompatible pairings; a stale v:1 predictor co-located with
+/// a v:2 host would silently lose `account_id` if the handshake didn't fire.
+const EXPECTED_PREDICTOR_VERSION: &str = "0.6.0";
 
 struct Sidecar {
     sender: Sender<String>,
@@ -68,7 +73,12 @@ pub fn init() {
 
 /// Forward a successful poll result to the predictor. Non-blocking; safe to
 /// call from any thread. No-op if the sidecar isn't running.
-pub fn record_observation(data: &AppUsageData) {
+///
+/// `account_id` is the host's view of which Claude account the `cc` bucket
+/// belongs to (see DECISIONS.md ADR-011). Pass `None` when the account
+/// can't be determined — the predictor falls back to a default-account
+/// keyed window rather than dropping the observation.
+pub fn record_observation(data: &AppUsageData, account_id: Option<&str>) {
     let Some(Some(sidecar)) = SIDECAR.get() else {
         return;
     };
@@ -76,6 +86,7 @@ pub fn record_observation(data: &AppUsageData) {
     let timestamp = format_iso8601_now();
     let observe = ObserveMessage::new(
         &timestamp,
+        account_id,
         data.claude_code.as_ref().map(buckets_from),
         data.codex.as_ref().map(buckets_from),
     );

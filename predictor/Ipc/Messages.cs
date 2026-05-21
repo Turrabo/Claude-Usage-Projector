@@ -7,16 +7,33 @@ namespace ClaudeUsageProjector.Predictor.Ipc;
 // protocol without surprising the other end, and a "type" discriminator the
 // receiver dispatches on. Each message is a flat record (no inheritance) so
 // the System.Text.Json source generator can produce clean code for it.
+//
+// Protocol versions:
+//   v: 1 — original. Single-account world. No account_id on observe/prediction.
+//   v: 2 — multi-auth (Phase 7, see DECISIONS.md ADR-011). Adds an
+//          optional `account_id` on ObserveMessage. The predictor reads
+//          it to key per-account state; when absent (older host paired
+//          with newer predictor), it falls back to a default-account
+//          window rather than dropping observations.
 
 // ---------- Host -> Predictor ----------
 
 public sealed record ObserveMessage
 {
-    [JsonPropertyName("v")] public int Version { get; init; } = 1;
+    [JsonPropertyName("v")] public int Version { get; init; } = 2;
     [JsonPropertyName("type")] public string Type { get; init; } = "observe";
 
     /// <summary>UTC timestamp of the observation, ISO 8601 with 'Z' suffix.</summary>
     [JsonPropertyName("t")] public required string TimestampUtc { get; init; }
+
+    /// <summary>
+    /// Stable opaque identifier of the Claude OAuth account the cc bucket
+    /// belongs to. Format: "acct_" + first 12 hex chars of SHA-256(jwt.sub).
+    /// Null when the host couldn't determine the active account — predictor
+    /// falls back to a default-account window rather than dropping the row.
+    /// Added in v:2 (Phase 7); v:1 messages don't carry this field.
+    /// </summary>
+    [JsonPropertyName("account_id")] public string? AccountId { get; init; }
 
     /// <summary>Claude Code usage. Null if the host couldn't read it this poll.</summary>
     [JsonPropertyName("cc")] public UsageBuckets? ClaudeCode { get; init; }
@@ -27,7 +44,7 @@ public sealed record ObserveMessage
 
 public sealed record ShutdownMessage
 {
-    [JsonPropertyName("v")] public int Version { get; init; } = 1;
+    [JsonPropertyName("v")] public int Version { get; init; } = 2;
     [JsonPropertyName("type")] public string Type { get; init; } = "shutdown";
 }
 
@@ -42,7 +59,7 @@ public sealed record UsageBuckets
 
 public sealed record LogMessage
 {
-    [JsonPropertyName("v")] public int Version { get; init; } = 1;
+    [JsonPropertyName("v")] public int Version { get; init; } = 2;
     [JsonPropertyName("type")] public string Type { get; init; } = "log";
 
     [JsonPropertyName("level")] public required string Level { get; init; }
@@ -56,8 +73,16 @@ public sealed record LogMessage
 /// </summary>
 public sealed record PredictionMessage
 {
-    [JsonPropertyName("v")] public int Version { get; init; } = 1;
+    [JsonPropertyName("v")] public int Version { get; init; } = 2;
     [JsonPropertyName("type")] public string Type { get; init; } = "prediction";
+
+    /// <summary>
+    /// Account this prediction is for. Mirrors the AccountId on the observe
+    /// that produced it. Predictor will eventually emit one prediction per
+    /// active account per cycle (Phase 7a.3+); for now this stays null
+    /// because routing isn't wired yet.
+    /// </summary>
+    [JsonPropertyName("account_id")] public string? AccountId { get; init; }
 
     /// <summary>When the prediction was computed (UTC, ISO 8601 Z).</summary>
     [JsonPropertyName("t")] public required string TimestampUtc { get; init; }

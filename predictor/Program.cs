@@ -95,7 +95,7 @@ catch (Exception ex)
     Log("warn", $"jsonl tail failed to start: {ex.Message}");
 }
 
-Log("info", $"ccum-predictor v0.5.0 started (pid={Environment.ProcessId})");
+Log("info", $"ccum-predictor v0.6.0 started (pid={Environment.ProcessId})");
 
 string? line;
 while ((line = Console.In.ReadLine()) is not null)
@@ -180,7 +180,10 @@ static void HandleObserve(
     var cx = observe.Codex is null
         ? "cx=none"
         : $"cx 5h={observe.Codex.FiveHourPct:0.0}% 7d={observe.Codex.SevenDayPct:0.0}%";
-    Log("info", $"observed @ {observe.TimestampUtc}  {cc}  {cx}");
+    // Phase 7a foundation: account_id is logged but not yet routed. State
+    // refactor to per-account windows lands in Phase 7a.3+.
+    var acct = observe.AccountId is null ? "acct=?" : $"acct={observe.AccountId}";
+    Log("info", $"observed @ {observe.TimestampUtc}  {acct}  {cc}  {cx}");
 
     if (observe.ClaudeCode is null) return;
 

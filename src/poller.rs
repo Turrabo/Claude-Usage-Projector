@@ -91,7 +91,8 @@ pub fn poll(show_claude_code: bool, show_codex: bool) -> Result<AppUsageData, Po
         Err(PollError::RequestFailed)
     } else {
         // === CSM EXTENSIONS BEGIN ===
-        crate::csm::sidecar::record_observation(&data);
+        let account_id = crate::csm::account_id::current_account_id();
+        crate::csm::sidecar::record_observation(&data, account_id.as_deref());
         // === CSM EXTENSIONS END ===
         Ok(data)
     }

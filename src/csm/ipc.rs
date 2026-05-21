@@ -1,10 +1,21 @@
 // IPC message types mirroring predictor/Ipc/Messages.cs. Line-delimited JSON
 // over the predictor child's stdin/stdout. Every message carries `v` and
 // `type` discriminators so the protocol can evolve safely.
+//
+// Protocol versions:
+//   v: 1 — original. Single-account world. Observe and prediction messages
+//          carry no account_id field.
+//   v: 2 — multi-auth (Phase 7, see DECISIONS.md ADR-011). Adds an
+//          `account_id` field to observe messages. Predictor uses it to
+//          key per-account state. The field is serialised optionally so
+//          a v:2 host can still talk to a v:1 predictor for the brief
+//          window between deploys (predictor falls back to a "default"
+//          account when account_id is absent) — though the version
+//          handshake added in commit 08e52f2 will warn loudly on mismatch.
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 // ---------- Host -> Predictor ----------
 
@@ -14,16 +25,29 @@ pub struct ObserveMessage<'a> {
     #[serde(rename = "type")]
     pub kind: &'static str,
     pub t: &'a str,
+    /// Stable opaque identifier for the Claude OAuth account the cc bucket
+    /// belongs to. Derived from the JWT's `sub` claim hashed with SHA-256
+    /// (see `src/csm/account_id.rs`). `None` when the host couldn't
+    /// determine the active account — predictor side falls back to a
+    /// "default" account in that case rather than dropping the observation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<&'a str>,
     pub cc: Option<UsageBuckets>,
     pub cx: Option<UsageBuckets>,
 }
 
 impl<'a> ObserveMessage<'a> {
-    pub fn new(timestamp_utc: &'a str, cc: Option<UsageBuckets>, cx: Option<UsageBuckets>) -> Self {
+    pub fn new(
+        timestamp_utc: &'a str,
+        account_id: Option<&'a str>,
+        cc: Option<UsageBuckets>,
+        cx: Option<UsageBuckets>,
+    ) -> Self {
         Self {
             v: PROTOCOL_VERSION,
             kind: "observe",
             t: timestamp_utc,
+            account_id,
             cc,
             cx,
         }

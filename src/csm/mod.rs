@@ -14,6 +14,7 @@
 // system tray remains valid for the combined unit. It also owns the hover
 // trigger that opens the popup.
 
+pub mod account_id;
 pub mod badge;
 pub mod hover;
 pub mod ipc;
