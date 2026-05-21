@@ -1,17 +1,24 @@
-// Shared state for the hover popup. The predictor sidecar's reader thread
-// `push`es each parsed PredictionMessage; the popup's WM_PAINT handler reads
-// the latest snapshot plus a rolling history of (timestamp, used_pct, rate,
-// hawkes_ratio) entries. Bounded to a few hours so the in-memory cost stays
-// negligible.
+// Per-account state for the hover popup. The predictor sidecar's reader
+// thread `push`es each parsed PredictionMessage; routing is by `account_id`
+// (IPC v:2, see DECISIONS.md ADR-011). `snapshot()` returns the data for the
+// account currently active on this machine, derived from the local Claude
+// credentials file via `account_id::current_account_id`. Phase 7a.4 plumbing
+// only — the popup and badge still see one account; multi-account UI is
+// Phase 7c.
 //
 // All public methods take a short-lived lock and copy out the data; the popup
 // renderer must not hold a reference into the store across Win32 calls.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
 
+use crate::csm::account_id::{current_account_id, DEFAULT_ACCOUNT_ID};
 use crate::csm::ipc::PredictionMessage;
 
+// Per-account cap. With three real accounts plus the `acct_default` bucket
+// (which holds pre-multi-auth backfill until Phase 7b migrates it) the upper
+// bound is ~4×600 = 2400 entries — still negligible memory; each entry is a
+// handful of words.
 const HISTORY_LIMIT: usize = 600; // ~10 hours at one prediction per minute
 
 #[derive(Clone, Debug)]
@@ -47,9 +54,14 @@ pub struct LatestPrediction {
     pub stale: bool,
 }
 
-struct Inner {
+#[derive(Default)]
+struct AccountState {
     latest: Option<LatestPrediction>,
     history: VecDeque<HistoryEntry>,
+}
+
+struct Inner {
+    by_account: HashMap<String, AccountState>,
 }
 
 pub struct PredictionStore {
@@ -61,8 +73,7 @@ static STORE: OnceLock<PredictionStore> = OnceLock::new();
 pub fn store() -> &'static PredictionStore {
     STORE.get_or_init(|| PredictionStore {
         inner: Mutex::new(Inner {
-            latest: None,
-            history: VecDeque::with_capacity(HISTORY_LIMIT),
+            by_account: HashMap::new(),
         }),
     })
 }
@@ -87,17 +98,31 @@ impl PredictionStore {
             frozen: msg.rate_frozen_from_idle.unwrap_or(false),
         };
 
+        // Route by account_id. A v:1 predictor (or a v:2 predictor that
+        // couldn't determine the account) leaves the field null; we map
+        // that to the same sentinel the predictor uses for its observe
+        // routing, so both sides end up keyed identically.
+        let account_id = msg
+            .account_id
+            .as_deref()
+            .unwrap_or(DEFAULT_ACCOUNT_ID)
+            .to_string();
+
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        let state = inner.by_account.entry(account_id).or_default();
+
+        if state.history.len() == HISTORY_LIMIT {
+            state.history.pop_front();
+        }
+        state.history.push_back(entry);
+
         // tier=0 is the predictor's "backfill" marker emitted at startup for
         // each replayed historical observation. Push it into history so the
         // chart line is populated immediately, but leave `latest` alone —
         // there's no live projection or risk to display for a stale point.
         if msg.tier == 0 {
-            if let Ok(mut inner) = self.inner.lock() {
-                if inner.history.len() == HISTORY_LIMIT {
-                    inner.history.pop_front();
-                }
-                inner.history.push_back(entry);
-            }
             return;
         }
 
@@ -132,19 +157,41 @@ impl PredictionStore {
             reason: msg.reason.clone(),
             stale: msg.stale.unwrap_or(false),
         };
-
-        if let Ok(mut inner) = self.inner.lock() {
-            if inner.history.len() == HISTORY_LIMIT {
-                inner.history.pop_front();
-            }
-            inner.history.push_back(entry);
-            inner.latest = Some(latest);
-        }
+        state.latest = Some(latest);
     }
 
+    /// Latest live prediction + rolling history for the account currently
+    /// active on this machine. "Active" resolves via
+    /// `account_id::current_account_id`, falling back to
+    /// `DEFAULT_ACCOUNT_ID` when credentials are unreadable — matching the
+    /// predictor's own fallback so both sides agree on the bucket.
+    /// Returns empty when that account hasn't received any predictions yet.
+    ///
+    /// Phase 7a.4 plumbing only: callers (`badge.rs`, `popup.rs`) keep
+    /// seeing exactly one account. The internal `snapshot_for_account`
+    /// helper below is private today; Phase 7c will promote it to `pub`
+    /// (or add a sibling `accounts()` enumerator) to feed the multi-
+    /// account popover table.
     pub fn snapshot(&self) -> (Option<LatestPrediction>, Vec<HistoryEntry>) {
+        let active = current_account_id().unwrap_or_else(|| DEFAULT_ACCOUNT_ID.to_string());
+        self.snapshot_for_account(&active)
+    }
+
+    /// Same as `snapshot()` but for an explicit account id. Used by tests
+    /// today and earmarked for Phase 7c's multi-account popover table.
+    /// Returns `(None, vec![])` if the account hasn't been seen yet.
+    fn snapshot_for_account(
+        &self,
+        account_id: &str,
+    ) -> (Option<LatestPrediction>, Vec<HistoryEntry>) {
         match self.inner.lock() {
-            Ok(inner) => (inner.latest.clone(), inner.history.iter().cloned().collect()),
+            Ok(inner) => match inner.by_account.get(account_id) {
+                Some(state) => (
+                    state.latest.clone(),
+                    state.history.iter().cloned().collect(),
+                ),
+                None => (None, Vec::new()),
+            },
             Err(_) => (None, Vec::new()),
         }
     }
@@ -176,4 +223,136 @@ fn parse_iso8601_unix(s: &str) -> Option<i64> {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era as i64 * 146_097 + doe as i64 - 719_468;
     Some(days * 86_400 + hour as i64 * 3600 + minute as i64 * 60 + second as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(account: Option<&str>, tier: u32, used: f64) -> PredictionMessage {
+        PredictionMessage {
+            v: Some(2),
+            kind: Some("prediction".into()),
+            t: Some("2026-05-21T10:00:00Z".into()),
+            account_id: account.map(str::to_string),
+            tier,
+            risk: "green".into(),
+            reason: None,
+            stale: None,
+            used_pct: Some(used),
+            refresh_at: None,
+            rate_per_min: None,
+            rate_stddev: None,
+            projected_empty_p50: None,
+            projected_empty_p75: None,
+            projected_empty_p90: None,
+            prob_empty_before_refresh: None,
+            projected_pct_at_refresh: None,
+            projected_empty_before_refresh: None,
+            engine: None,
+            activity: None,
+            active_sessions: None,
+            rate_frozen_from_idle: None,
+            hawkes_ratio: None,
+            hawkes_mu: None,
+            hawkes_alpha: None,
+            hawkes_beta: None,
+            hawkes_events: None,
+        }
+    }
+
+    fn fresh_store() -> PredictionStore {
+        PredictionStore {
+            inner: Mutex::new(Inner {
+                by_account: HashMap::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn push_routes_by_account_id() {
+        let store = fresh_store();
+        store.push(&msg(Some("acct_AAAA"), 2, 10.0));
+        store.push(&msg(Some("acct_BBBB"), 2, 90.0));
+
+        let (a_latest, _) = store.snapshot_for_account("acct_AAAA");
+        let (b_latest, _) = store.snapshot_for_account("acct_BBBB");
+        assert_eq!(a_latest.unwrap().used_pct, Some(10.0));
+        assert_eq!(b_latest.unwrap().used_pct, Some(90.0));
+    }
+
+    #[test]
+    fn push_with_missing_account_id_uses_default_sentinel() {
+        let store = fresh_store();
+        store.push(&msg(None, 2, 42.0));
+        let (latest, _) = store.snapshot_for_account(DEFAULT_ACCOUNT_ID);
+        assert_eq!(latest.unwrap().used_pct, Some(42.0));
+    }
+
+    #[test]
+    fn other_accounts_are_isolated() {
+        // Pushing to A must not surface in B — this is the regression the
+        // 7a.4 refactor exists to prevent (pre-refactor the single global
+        // `latest` would be overwritten by whichever account pushed last).
+        let store = fresh_store();
+        store.push(&msg(Some("acct_AAAA"), 2, 10.0));
+        let (b_latest, b_hist) = store.snapshot_for_account("acct_BBBB");
+        assert!(b_latest.is_none());
+        assert!(b_hist.is_empty());
+    }
+
+    #[test]
+    fn tier_zero_backfill_appends_history_but_not_latest() {
+        let store = fresh_store();
+        store.push(&msg(Some("acct_AAAA"), 0, 5.0));
+        let (latest, hist) = store.snapshot_for_account("acct_AAAA");
+        assert!(latest.is_none(), "tier=0 must not set latest");
+        assert_eq!(hist.len(), 1);
+    }
+
+    #[test]
+    fn unknown_account_snapshot_is_empty() {
+        // Querying an account that has received no predictions returns the
+        // empty (None, vec![]) tuple — the popup renderer relies on this to
+        // hit its "no snapshots yet" hint rather than panic on a missing key.
+        let store = fresh_store();
+        let (latest, hist) = store.snapshot_for_account("acct_unseen");
+        assert!(latest.is_none());
+        assert!(hist.is_empty());
+    }
+
+    #[test]
+    fn interleaved_pushes_stay_isolated() {
+        // A, B, A, B, A — each account's history should grow independently
+        // without cross-contamination, and each account's `latest` should
+        // reflect its own most recent push.
+        let store = fresh_store();
+        store.push(&msg(Some("acct_AAAA"), 2, 10.0));
+        store.push(&msg(Some("acct_BBBB"), 2, 50.0));
+        store.push(&msg(Some("acct_AAAA"), 2, 11.0));
+        store.push(&msg(Some("acct_BBBB"), 2, 51.0));
+        store.push(&msg(Some("acct_AAAA"), 2, 12.0));
+
+        let (a_latest, a_hist) = store.snapshot_for_account("acct_AAAA");
+        let (b_latest, b_hist) = store.snapshot_for_account("acct_BBBB");
+        assert_eq!(a_latest.unwrap().used_pct, Some(12.0));
+        assert_eq!(b_latest.unwrap().used_pct, Some(51.0));
+        assert_eq!(a_hist.len(), 3);
+        assert_eq!(b_hist.len(), 2);
+    }
+
+    #[test]
+    fn history_limit_is_per_account() {
+        let store = fresh_store();
+        for _ in 0..(HISTORY_LIMIT + 5) {
+            store.push(&msg(Some("acct_AAAA"), 2, 1.0));
+        }
+        for _ in 0..3 {
+            store.push(&msg(Some("acct_BBBB"), 2, 1.0));
+        }
+        let (_, a_hist) = store.snapshot_for_account("acct_AAAA");
+        let (_, b_hist) = store.snapshot_for_account("acct_BBBB");
+        assert_eq!(a_hist.len(), HISTORY_LIMIT, "A capped at limit");
+        assert_eq!(b_hist.len(), 3, "B's count unaffected by A's overflow");
+    }
 }

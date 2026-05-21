@@ -19,6 +19,15 @@ use sha2::{Digest, Sha256};
 
 use crate::diagnose;
 
+/// Sentinel used when the active account can't be determined (credentials
+/// file missing/unreadable, pre-login state, or a v:1 host paired with a
+/// v:2 predictor). Matches the `DefaultAccountId` constant on the predictor
+/// side so observe-routing and prediction-store lookup agree on the same
+/// bucket. Phase 7b's persistence migration will retag pre-multi-auth rows
+/// out of this bucket; until then it's also where the predictor's
+/// startup-replayed backfill lands.
+pub const DEFAULT_ACCOUNT_ID: &str = "acct_default";
+
 /// Cache of the last-derived account_id and the credentials-file mtime
 /// when we computed it. Re-reads the file only when its mtime changes.
 struct Cache {
