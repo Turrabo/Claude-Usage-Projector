@@ -31,15 +31,17 @@ Originally scoped as one sub-milestone; split during implementation into three c
 - Predictor emits the active `account_id` on every `PredictionMessage`. Backfill at startup goes to sentinel `acct_default`.
 - Host's `format_prediction` log line now includes `acct=…` so the diagnose log shows routing.
 
-**7a.4 (pending)** — host-side `prediction_store` keyed by account.
-- `src/csm/prediction_store.rs` is still a single global `OnceLock<PredictionStore>` with `latest: Option<LatestPrediction>` and one `VecDeque<HistoryEntry>`. Today's predictor emits `account_id` on every message but the host discards it — `PredictionMessage`s arriving from different accounts overwrite each other's `latest` and interleave in `history`.
-- For 7a.4: refactor `PredictionStore` to `HashMap<AccountId, AccountState>` where each `AccountState` holds its own `latest + history`. `badge.rs` and `popup.rs` continue to read the *active* account only (UI change comes in 7c); this commit is plumbing-only.
-- Existing `LatestPrediction` and `HistoryEntry` structs are unchanged; only the container shape changes.
-- Estimated effort: ~half a day. Naturally pairs with a third reviewer-checkpoint pass before push.
+**7a.4 (shipped, commit `ca6e285`)** — host-side `prediction_store` keyed by account.
+- `src/csm/prediction_store.rs` refactored: `PredictionStore` now holds `HashMap<AccountId, AccountState>` where each `AccountState` carries its own `latest + history`. `push()` routes by `msg.account_id`, falling back to the `acct_default` sentinel (matching the predictor's own fallback) so a v:1↔v:2 mispairing or an unreadable credentials.json still deposits observations somewhere reachable.
+- `snapshot()` resolves the active account via `account_id::current_account_id()` and returns just that bucket; `badge.rs` and `popup.rs` are unchanged. Multi-account UI is Phase 7c.
+- A private `snapshot_for_account()` helper backs both `snapshot()` and the unit tests; Phase 7c will promote it (or a sibling `accounts()` enumerator) to feed the per-account popover table.
+- `LatestPrediction` and `HistoryEntry` structs unchanged — only the container shape changed, as planned.
+- `pub const DEFAULT_ACCOUNT_ID: &str = "acct_default"` added in `src/csm/account_id.rs` so the host and predictor agree on the sentinel string from a single Rust home (matched by `Program.cs`'s `DefaultAccountId` literal — cross-language drift risk noted, but the IPC contract is the canonical source).
+- 7 unit tests added covering account routing, the missing-account-id fallback, cross-account isolation (sequential and interleaved), the `tier=0` backfill carve-out, the empty-store path, and per-account history-limit independence.
 
-**Acceptance for 7a as a whole** (after 7a.4 lands): launch the widget, run `claude login` to switch accounts on a single machine, observe in the diagnose log that observations get attributed to the new `account_id` within a few seconds AND that the badge/popup keep showing the active account's data without seeing the older account's stale projection bleed through.
+**Known transient regression** (cleared by 7b): until 7b shards `history.jsonl` per account and re-tags legacy rows, the predictor's startup backfill still emits `AccountId=DefaultAccountId` even when the user has a real active account. A first-launch popover on the real account will therefore show an empty chart for a few seconds until live predictions accrue, while the backfilled history sits orphaned in the `acct_default` bucket. 7b's acceptance criterion (the popover chart continues to show the user's full prior history under the active account) is what closes this.
 
-Estimated effort remaining: half a day for 7a.4.
+**Acceptance for 7a as a whole** (now testable): launch the widget, run `claude login` to switch accounts on a single machine, observe in the diagnose log that observations get attributed to the new `account_id` within a few seconds AND that the badge/popup keep showing the active account's data without seeing the older account's stale projection bleed through.
 
 ### 7b — Persistence sharding + one-time migration
 

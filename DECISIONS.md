@@ -282,7 +282,7 @@ Option (C). The full design:
 
 ### Consequences
 
-- IPC schema becomes load-bearing. The `account_id` field is required and validated at the predictor. Future protocol changes need to follow the same `v: N` bump discipline.
+- IPC schema becomes load-bearing. The `account_id` field is wire-optional but semantically required: both the predictor (`Program.cs`) and the host's `prediction_store` accept a null/absent `account_id` and route the observation/prediction to a shared `"acct_default"` sentinel bucket rather than dropping it. This is the graceful path for a v:1↔v:2 mispairing during a partial upgrade or an unreadable `credentials.json`; the version-handshake added in commit `08e52f2` still surfaces the mismatch in the diagnose log. Future protocol changes need to follow the same `v: N` bump discipline.
 - Persistence migration is one-way. The old `history.jsonl` format is converted to sharded files at first launch on Phase 7. Downgrade to a pre-Phase-7 build would not see the new shards and would re-create the flat file from scratch (with whatever live observations come in). Acceptable for a single-maintainer project.
 - The Hawkes model becomes per-account, which means smaller per-account training data. For accounts used heavily this is fine; for low-volume accounts the predictor may sit on default parameters longer before fitting. We accept the tradeoff because pooling across accounts conflates very different usage rhythms.
 - Active-account detection ties us to Claude CLI's storage layout (`~/.claude/credentials.json`). If Anthropic restructures that file the detector breaks gracefully (predictor falls back to a single-account mode) — but we should keep an eye on Claude CLI releases.
