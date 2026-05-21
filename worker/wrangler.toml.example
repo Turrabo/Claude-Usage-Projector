@@ -1,0 +1,22 @@
+name = "claude-usage-sync"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+# Replace the database_id below with the value `wrangler d1 create` printed
+# for you. The name should match; only the id is per-account.
+[[d1_databases]]
+binding = "DB"
+database_name = "claude-usage-sync"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+
+# Substitute your own subdomain. The route is bound as a Custom Domain so
+# Cloudflare manages the DNS record automatically; you'll have to add the
+# DNS record manually first if your domain isn't on Cloudflare DNS.
+# See worker/README.md for full setup walkthrough.
+[[routes]]
+pattern = "sync.your-domain.example/*"
+custom_domain = true
+
+# Observability. Cheap to leave on; off by default in wrangler 3+.
+[observability]
+enabled = true

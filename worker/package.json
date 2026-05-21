@@ -1,0 +1,18 @@
+{
+  "name": "claude-usage-sync-worker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloudflare Worker for cross-machine sync of Claude-Usage-Projector observations. Deploy under your own Cloudflare account; see README.md and DECISIONS.md ADR-012.",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "schema:apply": "wrangler d1 execute claude-usage-sync --remote --file=schema.sql",
+    "schema:local": "wrangler d1 execute claude-usage-sync --local --file=schema.sql"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240909.0",
+    "typescript": "^5.5.0",
+    "wrangler": "^3.78.0"
+  }
+}

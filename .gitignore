@@ -34,3 +34,11 @@ workflow.cmd
 
 # Local WinGet manifest generation output
 /manifests/
+
+# Cloudflare Worker (sync subproject). The .example template is committed;
+# the real wrangler.toml carries the maintainer's D1 database_id + subdomain
+# and stays local. Wrangler caches + node_modules also stay out.
+/worker/wrangler.toml
+/worker/.wrangler/
+/worker/node_modules/
+/worker/.dev.vars

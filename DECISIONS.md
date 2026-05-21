@@ -250,3 +250,81 @@ One-time admin setup populates the SDK cache: `xwin --accept-license splat --out
 - ADR-005's gnullvm path is kept as a compile-check fallback (`cargo check`/`clippy` against the gnullvm toolchain, which is faster than spinning up cargo-xwin for type-checking).
 - `winres = "0.1"` doesn't support `rc.exe` overrides directly; the `SKIP_WINRES` escape hatch in `build.rs` (~6 lines) is the cleanest workaround. A future upgrade to a more flexible resource-embed crate (e.g. `embed-resource`) could remove that hatch, but the current approach is low-overhead.
 - xwin caches the SDK at `%LOCALAPPDATA%\cargo-xwin\xwin\` — ~1 GB on disk. Cleanup with `Remove-Item -Recurse $env:LOCALAPPDATA\cargo-xwin` if it ever needs to be rebuilt.
+
+---
+
+## ADR-011: Multi-auth — account identity model and per-account state
+
+**Date:** 2026-05-21
+**Status:** Accepted (design phase; implementation in Phase 7 — see [`docs/PHASE-7-PLAN.md`](docs/PHASE-7-PLAN.md))
+
+### Context
+
+The maintainer uses three Claude OAuth identities — two `@instem.com` work accounts plus `turrabo@gmail.com` personal — primarily one per machine but with opportunistic switching when one hits its 5-hour limit. The current architecture is single-tenant top to bottom: credentials, polling, IPC envelopes, predictor state, persistence, and UI all assume "the one observation stream" (see the multi-auth audit, 2026-05-21). To meet the user need ("see all three accounts' usage so I know which to switch to when one runs out"), every layer needs an `account_id` dimension.
+
+Three architectural shapes were evaluated:
+
+- (A) **Multiple host instances**, one per account. Each host runs its own predictor sidecar. Cheapest code but the worst UX (three badges fighting for taskbar space, no possibility of aggregated views) and triples polling/memory cost.
+- (B) **One host, internal multiplexing, one predictor sidecar per account.** Process isolation between accounts but 3× IPC plumbing for no real benefit — predictors don't fight each other and the host has to demultiplex per-account UI state anyway.
+- (C) **One host, one predictor, account-tagged messages.** IPC bumped to `v: 2` adding an `account_id` field; predictor state keyed by account in a dictionary; persistence per-account; UI shows the *active* account on the badge and *all* accounts in the popover.
+
+### Decision
+
+Option (C). The full design:
+
+- **Account identity** is derived from the OAuth credential's `sub` claim (JWT subject), hashed to a stable short string. This avoids putting email addresses in transit / on disk and is stable across token rotations for the same account. Concretely: `account_id = "acct_" + first 12 hex chars of SHA-256(jwt.sub)`.
+- **Active-account-on-this-machine** is whichever account `~/.claude/credentials.json` currently points at. The predictor reads this file at startup and watches it for changes (FileSystemWatcher). When the user runs `claude login` and switches accounts, the predictor picks up the new identity within seconds and the badge re-routes to it. Inactive accounts on this machine still appear in the popover via cross-machine sync data (see ADR-012).
+- **IPC** bumps to `v: 2`. Every `observe` and `prediction` message carries an `account_id` field. Older host/predictor pairs (`v: 1`) won't interoperate with newer ones; the version-handshake added in commit `08e52f2` already flags this loudly.
+- **Predictor state** becomes `Dictionary<AccountId, ObservationWindow>` and `Dictionary<AccountId, TelemetryWindow>`. Tier 1/2/3 maths run per-account. Hawkes parameter fitting is per-account too — each account has its own typing rhythm.
+- **Persistence** shards `history.jsonl` by account into `history-<account_id>.jsonl`. Existing single-account `history.jsonl` is migrated on first run after upgrade: the predictor reads it, tags the rows with the now-detected `account_id`, and writes them to the sharded file. Original file kept as `history.jsonl.pre-multi-auth-backup`.
+- **UI** — badge shows risk + runout for the active account only (no extra taskbar real estate vs today). Popover top row gains a per-account breakdown table: account name, risk, runout, "(this machine)" or "(other)" tag based on which machine produced the most recent observation. Chart underneath remains driven by the active account.
+- **`JsonlTail`** (the `~/.claude/projects/**/*.jsonl` reader feeding the Hawkes tier) cannot tell which account a session was logged in with. We accept this: Hawkes intensity for each account uses whichever sessions ran while that account was the active one on this machine, attributed via the active-account watcher's history. Cross-machine, session timing data is **not** synced (sensitivity reasons — see ADR-012).
+
+### Consequences
+
+- IPC schema becomes load-bearing. The `account_id` field is required and validated at the predictor. Future protocol changes need to follow the same `v: N` bump discipline.
+- Persistence migration is one-way. The old `history.jsonl` format is converted to sharded files at first launch on Phase 7. Downgrade to a pre-Phase-7 build would not see the new shards and would re-create the flat file from scratch (with whatever live observations come in). Acceptable for a single-maintainer project.
+- The Hawkes model becomes per-account, which means smaller per-account training data. For accounts used heavily this is fine; for low-volume accounts the predictor may sit on default parameters longer before fitting. We accept the tradeoff because pooling across accounts conflates very different usage rhythms.
+- Active-account detection ties us to Claude CLI's storage layout (`~/.claude/credentials.json`). If Anthropic restructures that file the detector breaks gracefully (predictor falls back to a single-account mode) — but we should keep an eye on Claude CLI releases.
+- Pairs with ADR-012 — the multi-auth and sync features are coupled architecturally even though they're separable in code.
+
+---
+
+## ADR-012: Cross-machine sync via a personal Cloudflare Worker
+
+**Date:** 2026-05-21
+**Status:** Accepted (design phase; implementation in Phase 7 — see [`docs/PHASE-7-PLAN.md`](docs/PHASE-7-PLAN.md))
+
+### Context
+
+ADR-011 makes the badge + popover aware of three Claude accounts. The maintainer wants those views populated on *every* machine — so on the work laptop he can see how the personal account is doing too, even though the personal account's OAuth token only lives on the personal machine. Without cross-machine data flow, the badge on each machine would only know about the accounts whose tokens are stored locally, and the "see all three" goal collapses to "see whichever fraction is signed in here right now."
+
+The multi-machine sync audit (2026-05-21) evaluated four mechanisms: cloud-sync folder (OneDrive/Dropbox), shared LAN drive, git auto-commit, and a small custom service. The user has ruled out corporate cloud storage and is also unhappy with file-sync latency (OneDrive can take minutes to propagate). He already has his own Cloudflare infrastructure — a tunnel at `daisybot.co.uk` reverse-proxying to a local OWUI Docker instance, behind Cloudflare Zero Trust with Google SSO. A read-only API token + his other agent's investigation (transcript 2026-05-21) confirmed:
+
+- No existing Workers, Pages, KV namespaces, D1 databases, or R2 buckets on the account.
+- The Cloudflare Free plan limits (100 k requests/day, 1 GB D1, 25 M D1 reads/day) are ~100× larger than our load.
+- Cloudflare Access supports Service Tokens (`CF-Access-Client-Id` / `CF-Access-Client-Secret` header pair), distinct from the interactive Google SSO policy on the existing OWUI app.
+
+### Decision
+
+A dedicated Cloudflare Worker deployed to a new subdomain `sync.daisybot.co.uk`, backed by a new D1 database `claude-usage-sync`. Owned entirely by the maintainer; not part of the product's user-facing setup story for colleagues (sync is optional, off by default).
+
+Concretely:
+
+- **D1 schema** — one `observations` table with columns `(ts INTEGER, account_id TEXT, machine_id TEXT, used_pct REAL, refresh_at INTEGER)` and a composite primary key of `(account_id, machine_id, ts)` plus an index on `ts` for range queries. Schema lives at `worker/schema.sql` in this repo so future migrations are versioned alongside the code.
+- **Worker code** — TypeScript, ~100 LoC, lives at `worker/src/index.ts`. Two endpoints: `POST /observations` (accepts a batch of observations, `INSERT OR IGNORE` to be idempotent against retries), `GET /observations?since=<unix>&account_id=<id>` (returns rows by time range, optionally filtered by account). No authorisation logic in the Worker itself — Cloudflare Access in front rejects anything without a valid service token.
+- **Auth** — one Cloudflare Access Service Token *per machine*, configured via a fresh Access app on `sync.daisybot.co.uk`. Keeps the blast radius tight: a leaked sync token can only reach the sync API, not the existing OWUI tunnel on `daisybot.co.uk`. The Worker trusts the `Cf-Access-Authenticated-User-Email` / `Cf-Access-Client-Id` headers — Cloudflare won't pass through requests that fail Access policy, so by the time the Worker sees a request it's already authenticated.
+- **Predictor integration** — the C# predictor sidecar owns sync. After each local observation lands, the predictor `POST`s it to the Worker (~one POST/minute/machine). The predictor also `GET`s for new observations since its last-known sync timestamp once every 30 seconds, deserialises them, and feeds them into the relevant `ObservationWindow`. Latency: sub-second from POST to other machines' next GET.
+- **Failure handling** — if the Worker is unreachable, the predictor falls back to local-only operation and retries on the next poll. Sync is best-effort; the local widget stays useful when offline or when Cloudflare has an outage. Sync state (last-synced timestamp per account) lives in `state.json` alongside the existing Hawkes-state-pending notes in `CLAUDE.md` Conventions.
+- **Configuration** — sync credentials live in `%APPDATA%\Claude-Code-Usage-Monitor\predictor\sync.env` (Windows) with fields `SYNC_URL`, `SYNC_CLIENT_ID`, `SYNC_CLIENT_SECRET`, `MACHINE_ID`. If the file is missing or unreadable, sync is silently disabled. This is the per-machine config; it's intentionally not committed to the repo.
+
+### Consequences
+
+- **User-owned infrastructure.** The Worker and D1 live entirely under the maintainer's Cloudflare account. No third party (other than Cloudflare itself) sees the data. Privacy threat model is exactly what the user asked for: not corporate cloud, not a shared third-party service.
+- **Sync is optional and personal.** Colleagues running the widget don't get sync by default and don't need to set it up; the widget works fine without it. Any future user who *wants* sync replicates the same setup with their own Cloudflare account. We document this clearly in `worker/README.md`.
+- **The Worker is in-repo.** Source under `worker/`, deployed via `wrangler deploy`. Lives alongside `predictor/` as a peer sub-project. Future contributors get the whole picture in one git clone.
+- **One-time dashboard setup.** Even with the source in-repo, the maintainer (or any future user enabling sync) has to do click-through configuration in the Cloudflare Zero Trust dashboard: create the D1 database, create one service token per machine, create the Access app. `worker/README.md` documents the exact sequence.
+- **D1 is single-region.** Cloudflare D1 picks one region for the primary; cross-region reads have edge latency. For two machines in the UK (Instem office + personal home) this is irrelevant. If the user ever uses the widget from a US/Asia machine the latency story may need revisiting (mitigation: move to KV with eventual consistency, or partition).
+- **No conflict resolution needed.** The composite primary key `(account_id, machine_id, ts)` means concurrent writes from different machines can't collide; idempotent `INSERT OR IGNORE` handles retry storms. Observations are immutable once written; no UPDATE path is needed.
+- **`JsonlTail` data stays machine-local.** The Hawkes-feeding session-timing data from `~/.claude/projects/**/*.jsonl` is more sensitive than the OAuth-derived percentages (it timestamps when you ran what session). It is intentionally NOT synced — each machine's Hawkes model uses local data only. Tier 1/2 (the chart-driving tiers) are the synced bits.
+- **Cost.** Expected steady-state: ~2 requests/minute/machine × 2 machines = ~5800 requests/day, well within the Workers Free 100 k/day. D1 footprint is ~tens of KB/day; the 1 GB free quota is years away.
