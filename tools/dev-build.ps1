@@ -43,6 +43,14 @@ $importLib = Join-Path $mingwRoot 'x86_64-w64-mingw32\lib\libunwind.dll.a'
 $importLibBackup = $importLib + '.devbuild-bak'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 
+# Recovery: if a previous run was killed mid-build (Ctrl-C, BSOD, AV kill),
+# the libunwind.dll.a may be stuck under the .devbuild-bak suffix and the
+# real filename is missing. Restore it before doing anything else.
+if ((-not (Test-Path $importLib)) -and (Test-Path $importLibBackup)) {
+    Move-Item $importLibBackup $importLib -Force
+    Write-Host ('[{0}] Recovered libunwind.dll.a from a prior interrupted build.' -f (Get-Date -Format 'HH:mm:ss'))
+}
+
 $renamed = $false
 if (Test-Path $importLib) {
     Move-Item $importLib $importLibBackup -Force
@@ -55,6 +63,10 @@ if (Test-Path $importLib) {
 try {
     $newPath = $mingwBin + ';' + (Get-Item Env:PATH).Value
     Set-Item Env:PATH $newPath
+    # winres reads WINRES_TOOLCHAIN to locate the MinGW toolchain root. We
+    # set it here at runtime rather than committing it to .cargo/config.toml
+    # so the path stays correct as LLVM-MinGW updates and across machines.
+    Set-Item Env:WINRES_TOOLCHAIN $mingwRoot
     Set-Location $repoRoot
     $cargo = Join-Path (Get-Item Env:USERPROFILE).Value '.cargo\bin\cargo.exe'
     Write-Host ('[{0}] cargo build --release' -f (Get-Date -Format 'HH:mm:ss'))

@@ -2,7 +2,7 @@
 
 Tagged releases are how this fork distributes itself. Push a `v*` tag, GitHub Actions builds both binaries, bundles them into a single zip, and creates a Release page with the zip attached and notes auto-generated from the commit log since the previous tag.
 
-There is no separate signing step — the binaries are unsigned. First-launch SmartScreen requires the standard "More info → Run anyway" click-through. See [`DECISIONS.md`](../DECISIONS.md) for the recorded reasoning.
+There is no separate signing step — the binaries are unsigned. First-launch SmartScreen requires the standard "More info → Run anyway" click-through. Code-signing is permanently out of scope; see the Phase 6 row in [`../CLAUDE.md`](../CLAUDE.md).
 
 ## Cutting a release
 
@@ -62,4 +62,4 @@ Compress-Archive -Path "release-stage/*" -DestinationPath "ccum-windows-x64-v0.5
 # 4. Upload to a Release manually via the GitHub UI or `gh release create`.
 ```
 
-Bear in mind: a local build on a machine without MSVC (e.g. the gnullvm dev path) produces a binary that compiles but doesn't launch correctly — see [`DECISIONS.md`](../DECISIONS.md) ADR-005. So local-only releases only work on a machine with the standard MSVC toolchain.
+Bear in mind: this snippet assumes the standard MSVC toolchain. If you're on a machine without MSVC, use the cargo-xwin path (`tools/dev-build-msvc.ps1` — see [`BUILD.md`](BUILD.md) and ADR-010) for a runnable local binary, or just trigger CI. The older gnullvm compile-check path produces a binary that doesn't launch and is not suitable for releases.

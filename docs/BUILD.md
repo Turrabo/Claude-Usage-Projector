@@ -186,7 +186,7 @@ Each artifact is a zip containing one .exe.
    ```
 3. Double-click `claude-code-usage-monitor.exe` (or run from a command prompt to pass `--diagnose`)
 
-If Windows SmartScreen objects on first launch ("Windows protected your PC"), click **More info** → **Run anyway**. Signing the binaries (Phase 6) will eliminate this prompt.
+If Windows SmartScreen objects on first launch ("Windows protected your PC"), click **More info** → **Run anyway**. The binaries are deliberately unsigned — see [`RELEASING.md`](RELEASING.md) and the Phase 6 row in [`../CLAUDE.md`](../CLAUDE.md).
 
 ---
 

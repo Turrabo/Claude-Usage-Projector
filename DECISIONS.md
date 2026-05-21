@@ -97,7 +97,7 @@ Store observations and Claude Code events as append-only JSONL files; store Hawk
 ## ADR-005: GNU/gnullvm + LLVM-MinGW for local Rust builds; CI MSVC for runnable binaries
 
 **Date:** 2026-05-13
-**Status:** Accepted
+**Status:** Accepted — partially superseded by ADR-010 for runnable local binaries; gnullvm path retained as compile-check fallback.
 
 ### Context
 
@@ -136,7 +136,7 @@ Add a separate borderless `WS_EX_NOACTIVATE` popup window that appears after 200
 ### Consequences
 
 - Zero conflict surface with upstream widget layout: the popup is a separate HWND that upstream's code doesn't know about.
-- Implementation involves Win32 message handling (`TrackMouseEvent`, `WM_MOUSEHOVER`, `WM_MOUSELEAVE`) — slightly more complex than a click handler, but well-trodden Win32 territory.
+- Implementation uses a background cursor-poll thread (`src/csm/hover.rs`, 100 ms interval) tracking the badge HWND's screen rect against the cursor position. Simpler than `TrackMouseEvent`/`WM_MOUSEHOVER` and avoids per-frame Win32 callbacks; the polling cost is negligible at this interval.
 - Performance: 5-second repaint cadence while shown; ignored when hidden. Negligible.
 
 ---

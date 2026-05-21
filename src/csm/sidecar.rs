@@ -32,6 +32,16 @@ use crate::models::{AppUsageData, UsageData};
 const PREDICTOR_EXE: &str = "ccum-predictor.exe";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+/// Predictor version this host build expects to find co-located. Bumped
+/// manually on each release tag — the host's `Cargo.toml` version is
+/// upstream-inherited and unrelated. When host and predictor disagree the
+/// host writes a loud warning to the diagnose log so a user who has moved
+/// only one .exe across release boundaries notices before they file a bug
+/// about missing predictions. Predictor's startup log line is:
+///   "ccum-predictor v<X.Y.Z> started (pid=<n>)"
+/// — we parse the version out of that string.
+const EXPECTED_PREDICTOR_VERSION: &str = "0.5.0";
+
 struct Sidecar {
     sender: Sender<String>,
     // Kept alive for the process lifetime; dropping closes the channel and
@@ -138,7 +148,10 @@ fn spawn() -> Result<Sidecar, String> {
                 }
                 Some("log") | None => {
                     match serde_json::from_str::<crate::csm::ipc::LogMessage>(&line) {
-                        Ok(log) => diagnose::log(format!("predictor[{}] {}", log.level, log.msg)),
+                        Ok(log) => {
+                            diagnose::log(format!("predictor[{}] {}", log.level, log.msg));
+                            check_predictor_version(&log.msg);
+                        }
                         Err(_) => diagnose::log(format!("predictor(raw) {line}")),
                     }
                 }
@@ -172,6 +185,26 @@ fn spawn_writer(mut stdin: ChildStdin, rx: mpsc::Receiver<String>) {
         }
         diagnose::log("csm: predictor stdin writer ended");
     });
+}
+
+/// Parse the predictor's startup announcement and warn if the version
+/// doesn't match `EXPECTED_PREDICTOR_VERSION`. Called for every predictor
+/// log line — cheap when the prefix doesn't match (early return), so the
+/// cost on non-startup lines is one `strip_prefix`.
+fn check_predictor_version(msg: &str) {
+    let Some(after_prefix) = msg.strip_prefix("ccum-predictor v") else {
+        return;
+    };
+    let version = after_prefix.split_whitespace().next().unwrap_or("");
+    if version.is_empty() {
+        return;
+    }
+    if version != EXPECTED_PREDICTOR_VERSION {
+        diagnose::log(format!(
+            "csm: predictor version mismatch — host expects v{EXPECTED_PREDICTOR_VERSION}, predictor reports v{version}. \
+             You may have moved one .exe across release boundaries; replace one to match the other."
+        ));
+    }
 }
 
 fn classify_message(line: &str) -> Option<&str> {
