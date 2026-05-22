@@ -105,10 +105,9 @@ pub struct PredictionMessage {
     pub kind: Option<String>,
     pub t: Option<String>,
     /// Account this prediction belongs to (IPC v:2, Phase 7a.3+).
-    /// Optional so v:1 predictors and pre-routing v:2 backfill messages
-    /// still deserialise cleanly. Phase 7a.4 / 7c will key the
-    /// host's prediction_store by this; for now the format_prediction
-    /// log line includes it so the diagnose log shows account routing.
+    /// Optional so v:1 predictors and v:2 backfill messages still
+    /// deserialise cleanly; the host's `prediction_store` routes a null
+    /// value to the `acct_default` sentinel (Phase 7a.4, commit ca6e285).
     pub account_id: Option<String>,
     pub tier: u32,
     pub risk: String,

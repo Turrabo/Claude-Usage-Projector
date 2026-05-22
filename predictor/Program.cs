@@ -73,8 +73,11 @@ if (migrated is int m && m > 0)
 // flat history.jsonl format pre-dates per-account sharding. The next
 // observe with a real account_id will create that account's own window
 // and live data accrues there. Backfill predictions thus tag as
-// DefaultAccountId — the host's prediction_store currently doesn't key
-// by account so this is a no-op for UI today; Phase 7a.4 / 7c will fix.
+// DefaultAccountId and land in the host's prediction_store under the
+// same bucket (Phase 7a.4, commit ca6e285). Until Phase 7b shards
+// history.jsonl per account and retags legacy rows, a real-account
+// user's popover briefly shows an empty chart on first launch while
+// the backfill sits orphaned under DefaultAccountId.
 var reader = new HistoryJsonlReader();
 var persisted = reader.LoadAll(out var skipped);
 if (persisted.Count > 0)
@@ -214,9 +217,8 @@ static void HandleObserve(
         ? "cx=none"
         : $"cx 5h={observe.Codex.FiveHourPct:0.0}% 7d={observe.Codex.SevenDayPct:0.0}%";
     // Phase 7a.3: route observations to per-account windows. Missing
-    // account_id (v:1 host or unreadable credentials) routes to a
-    // sentinel "acct_default" so we never drop data.
-    const string DefaultAccountId = "acct_default";
+    // account_id (v:1 host or unreadable credentials) routes to the
+    // top-level `DefaultAccountId` sentinel so we never drop data.
     var accountId = observe.AccountId ?? DefaultAccountId;
     var acct = $"acct={accountId}";
     Log("info", $"observed @ {observe.TimestampUtc}  {acct}  {cc}  {cx}");
