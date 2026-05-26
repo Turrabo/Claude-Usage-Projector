@@ -348,7 +348,7 @@ Concretely:
 ## ADR-013: Native MSVC is the canonical local build path; cargo-xwin and gnullvm retired
 
 **Date:** 2026-05-26
-**Status:** Accepted — supersedes ADR-005 (gnullvm) and ADR-010 (cargo-xwin) for steady-state local development.
+**Status:** Accepted — supersedes ADR-005 (gnullvm) and ADR-010 (cargo-xwin) for steady-state local development. The 4th Context bullet and the 3rd Decision bullet (both claiming locally-built binaries crash USER32 0x35532 on this machine) were corrected by ADR-014 later the same day: a stale `rustup override` was silently routing builds through gnullvm despite this ADR's claim that MSVC was canonical. Native MSVC binaries do run cleanly; the cleanup pass missed `rustup override unset`.
 
 ### Context
 
@@ -376,3 +376,37 @@ ADR-005 (gnullvm + LLVM-MinGW, compile-check only) and ADR-010 (cargo-xwin + LLD
 - The "MSVC blocked by IT" framing in ADR-003, ADR-005, and ADR-010 was a false premise from Lesson 1. Per the append-only ADR discipline (CLAUDE.md global rule 4 — "retired entities only appear in retirement context"), those ADRs keep their original bodies and get supersession Status lines; this ADR documents the disproof.
 - The USER32 crash investigation becomes the next critical-path item for restoring local-runnable iteration. It does not block Phase 7b/7c/7d/7e work, but it should be resolved before Phase 7e (Worker sync integration), where local smoke-test cycles speed up iteration meaningfully.
 - Future updates to VS Build Tools may re-trigger McAfee's `ElevationServiceSupport: Blocked` policy. The no-spaces `C:\BuildTools` install path captured in this ADR is the durable workaround; document machine rebuild requirements alongside it.
+
+---
+
+## ADR-014: USER32 crash diagnosis was a stale gnullvm rustup override; native MSVC builds run cleanly
+
+**Date:** 2026-05-26
+**Status:** Accepted — corrects the "USER32 0x35532 crash on native MSVC" claim in ADR-013's Context and Decision sections. Native MSVC remains the canonical local build path per ADR-013; the workaround paragraph that pointed to CI artifacts is no longer needed.
+
+### Context
+
+ADR-013 (earlier today) recorded a "separate runtime bug" — locally-built host binaries crash USER32 `0xc0000005` at offset `0x35532` within ~1-2 seconds while CI-built binaries of byte-identical source run cleanly on the same machine. The auto-memory at `project_local_build_user32_crash.md` recorded the same signature against both the `cargo-xwin` and `native MSVC` build paths, diagnosed 2026-05-22. The investigation deferred to a future session was to diff PE headers between CI and local binaries to find a linker-level difference (DLL Characteristics, CFG flags, linker version, LoadConfig table) that could explain the crash.
+
+That investigation ran today (track C of the 2026-05-26 session). Results:
+
+1. **No PE-level difference exists.** `dumpbin /HEADERS /LOADCONFIG /IMPORTS` on commit `76b0ab0`'s CI artifact (SHA-256 `8321907a…`) vs a fresh local `cargo build --release` of the same source (SHA-256 `85bade30…`, both 887,296 bytes) produced 40 lines of diff total — entirely timestamps, PDB GUIDs, and ~0x100-byte address shifts in `.rdata`/Debug/TLS/LoadConfig directories caused by LTO non-determinism. DLL Characteristics flags, subsystem version, linker version, `/GS=32 /guardN=32` security feature stamps, list of 265 imported DLL functions, and Control Flow Guard tables were all identical.
+2. **The fresh local MSVC binary does not crash.** Smoke-tested 2026-05-26 11:34 with the production widget temporarily stopped: `target/release/claude-code-usage-monitor.exe --diagnose` launched cleanly, badge created, popup created, taskbar found, tray event hook installed, hover thread tracking the badge rect. Alive 60+ seconds with no crash, ~0.5s CPU and 17 MB RSS — normal steady-state.
+3. **The 2026-05-22 "native MSVC" test was actually a gnullvm test.** `rustup override list` from `C:\Source\Claude-Usage-Projector` showed `stable-x86_64-pc-windows-gnullvm` was still set as the directory override — a leftover from ADR-005's gnullvm era that ADR-013's cleanup pass missed. The override took precedence over the global default toolchain, so every `cargo build --release` from the repo dir invoked gnullvm + LLVM-MinGW + LLD instead of the MSVC linker, even when `vcvars64.bat` had been sourced and the maintainer believed `link.exe` was driving the build. The output binary went to `target/release/claude-code-usage-monitor.exe` (the default host-target path, regardless of toolchain choice), making the gnullvm build look like an MSVC build at every layer except the actual link.
+4. **The crash signature was the [gnullvm runtime bug](#adr-005-gnu-gnullvm--llvm-mingw-for-local-rust-builds-ci-msvc-for-runnable-binaries), not USER32 0x35532.** ADR-005 already records that gnullvm binaries silently exit ~5s after startup, almost certainly in the Win32 message loop. Identical crash offsets between "cargo-xwin" and "native MSVC" rows in the auto-memory should have been a red flag — two separate toolchains producing byte-different binaries do not crash at the same offset by coincidence. The probable explanation is that both rows were actually gnullvm binaries: the cargo-xwin path's `lld-link.exe` shim and the "native MSVC" path's silent gnullvm override both fed through similar code paths.
+
+### Decision
+
+- **Drop the rustup directory override.** `rustup override unset` from `C:\Source\Claude-Usage-Projector` is the canonical fix. `rustup show` from the repo dir now reports `stable-x86_64-pc-windows-msvc` as the active toolchain, which matches ADR-013's stated canonical path.
+- **Native MSVC local builds are confirmed runnable on this machine.** ADR-013's "Runnable on this maintainer's machine: still requires the CI artifact, pending USER32 crash resolution" is replaced by "Native `cargo build --release` produces a runnable binary." The CI artifact path remains useful for clean reproducible builds and for contributors without local MSVC, but is no longer a workaround for a crash.
+- **Investigation tooling preserved at `c:/tmp/track-c/`.** CI artifact, local MSVC binary, local gnullvm binary, and six `dumpbin` outputs are kept for future regression diagnosis using the same procedure.
+
+### Consequences
+
+- The "use CI artifacts on this machine" guidance in `docs/BUILD.md`, the auto-memory, and the various 2026-05-22 ADR commentary becomes obsolete. Local iteration loop drops from ~4 min (push → CI → download) to ~30 seconds (`cargo build --release` clean) on this machine. Incremental rebuilds drop to a few seconds.
+- **Lesson 3 (clean up rustup overrides when retiring toolchains):** When an ADR retires a toolchain (ADR-013 retired gnullvm and cargo-xwin), the cleanup checklist must include `rustup override list` and `rustup override unset` in every repo where the retired toolchain was active. ADR-013 deleted the wrapper scripts and updated `.cargo/config.toml` but left the per-repo rustup override in place, which silently defeated the entire "native MSVC is now canonical" claim for any `cargo build` run from inside the repo. The override is invisible at every layer except `rustup show` and `rustup override list` from the repo dir specifically; from outside the dir it looks like the global default is active.
+- **Lesson 4 (identical crash offsets across toolchains warrant suspicion):** ADR-005 and the project memory both recorded a USER32 0xc0000005 at offset 0x35532 against two different build paths (cargo-xwin and native MSVC). Two independently-linked binaries with different code layouts crashing at the same byte offset is implausible without a common root cause. The likeliest explanation — that one of the "different" paths was actually the same as the other under the hood — should have been investigated earlier. This is a generalisation of ADR-013's Lesson 2: smoke-test before declaring "runnable," and also cross-check signatures before declaring two failures independent.
+- ADR-013's Lesson 1 (PowerShell elevation quoting) and Lesson 2 (smoke-test before declaring "runnable") both still stand; Lesson 4 here extends Lesson 2 to the inverse case (smoke-test before declaring "broken" too).
+- The McAfee Endpoint Security alternative-hypothesis path investigated in track C is no longer needed. No IT escalation is required. The `ElevationServiceSupport: Blocked` policy noted in ADR-013 still applies to VS Build Tools updates, but does not affect the build or run path.
+- Phase 7e (Worker sync integration) can now use local smoke-test cycles rather than CI round-trips. No phase work was blocked by the prior misdiagnosis (CI artifacts were a working fallback) but the speed-up materially helps iteration.
+

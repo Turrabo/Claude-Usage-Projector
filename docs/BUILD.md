@@ -5,7 +5,7 @@ There are two binaries: `ccum-host.exe` (Rust) and `ccum-predictor.exe` (C# / .N
 Two supported workflows:
 
 1. [Building locally with MSVC](#standard-msvc-path) — the canonical path
-2. [Using CI-built artifacts](#ci-artifact-path) — for clean reproducible builds, machines without MSVC, or the maintainer's machine while the USER32 regression (see ADR-013) remains open
+2. [Using CI-built artifacts](#ci-artifact-path) — for clean reproducible builds or machines without MSVC installed
 
 Earlier revisions of this guide also described a cargo-xwin path and a gnullvm path; both were retired on 2026-05-26 when VS Build Tools turned out to install fine after all (the prior "MSVC blocked by IT" diagnosis was a PowerShell argument-quoting bug; see ADR-013). The history of those workarounds is preserved in ADR-005, ADR-010, and ADR-013 in [`../DECISIONS.md`](../DECISIONS.md).
 
@@ -50,11 +50,9 @@ target/release/claude-code-usage-monitor.exe --diagnose
 
 The widget should appear in your taskbar. Add `--diagnose` to log to `%TEMP%\claude-code-usage-monitor.log`.
 
-### Known issue — maintainer's machine only
+### Note on rustup directory overrides
 
-As of 2026-05-26, locally-built host binaries on the project maintainer's specific Windows 11 install crash with a USER32 access violation (`0xc0000005` at offset `0x35532`) within ~2 seconds of launch. CI-built binaries of byte-identical source run cleanly. Both cargo-xwin and native MSVC reproduce the crash, so it's not a toolchain issue — investigation is via PE-header diff (`dumpbin /HEADERS` + `/LOADCONFIG`), deferred.
-
-If you hit this on a fresh Windows install, please open an issue with the diagnose log. As a workaround, use the CI artifact path below.
+If `rustup show` from inside the repo lists a non-MSVC toolchain (`gnullvm`, `gnu`) as active "because: directory override for 'C:\\Source\\Claude-Usage-Projector'", that's a leftover from the retired gnullvm/cargo-xwin paths. Run `rustup override unset` from inside the repo dir to drop it, then `cargo clean` and rebuild. The override is invisible from outside the repo (`rustup show` elsewhere reports the global default) but silently routes every `cargo build` through the wrong toolchain. ADR-014 in [`../DECISIONS.md`](../DECISIONS.md) records the day this caught us out.
 
 ---
 

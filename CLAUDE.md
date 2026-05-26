@@ -47,9 +47,7 @@ The maintainer's machine has VS Build Tools 2022 (17.14.x) installed at `C:\Buil
 
 See [`docs/BUILD.md`](docs/BUILD.md) for full step-by-step instructions on each path.
 
-**Open issue — runnable host on the maintainer's machine**: as of 2026-05-26, locally-built host binaries crash with a USER32 access violation (`0xc0000005` at offset `0x35532`) within ~2 seconds of launch, while byte-identical CI artifacts run cleanly. Both cargo-xwin and native MSVC reproduce it, so the bug is in the source/build, not the toolchain. Investigation deferred; the planned next step is a `dumpbin /HEADERS` + `/LOADCONFIG` diff between the CI and local exes. Until resolved, use a CI artifact to run the widget on this machine (drop both .exes into `%LOCALAPPDATA%\Claude-Usage-Projector\` and "Start with Windows" via the tray menu).
-
-On a fresh machine without this regression, `cargo build --release` produces a runnable binary directly — no special steps.
+**Local builds on the maintainer's machine work.** `cargo build --release` produces a runnable host binary directly. The earlier "USER32 0x35532 crash" claim was a misattribution — a stale `rustup override` was routing the build through gnullvm despite ADR-013 declaring MSVC canonical. `rustup override unset` from inside the repo dropped the override; dumpbin diff between CI and local MSVC binaries showed only LTO-noise (timestamps, PDB GUIDs, ~0x100-byte address shifts) with no behaviourally-significant differences. See ADR-014 in [`DECISIONS.md`](DECISIONS.md).
 
 ## Phase plan (forward-looking)
 
