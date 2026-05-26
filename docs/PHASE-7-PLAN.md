@@ -39,18 +39,22 @@ Originally scoped as one sub-milestone; split during implementation into three c
 - `pub const DEFAULT_ACCOUNT_ID: &str = "acct_default"` added in `src/csm/account_id.rs` so the host and predictor agree on the sentinel string from a single Rust home (matched by `Program.cs`'s `DefaultAccountId` literal — cross-language drift risk noted, but the IPC contract is the canonical source).
 - 7 unit tests added covering account routing, the missing-account-id fallback, cross-account isolation (sequential and interleaved), the `tier=0` backfill carve-out, the empty-store path, and per-account history-limit independence.
 
-**Known transient regression** (cleared by 7b): until 7b shards `history.jsonl` per account and re-tags legacy rows, the predictor's startup backfill still emits `AccountId=DefaultAccountId` even when the user has a real active account. A first-launch popover on the real account will therefore show an empty chart for a few seconds until live predictions accrue, while the backfilled history sits orphaned in the `acct_default` bucket. 7b's acceptance criterion (the popover chart continues to show the user's full prior history under the active account) is what closes this.
-
 **Acceptance for 7a as a whole** (now testable): launch the widget, run `claude login` to switch accounts on a single machine, observe in the diagnose log that observations get attributed to the new `account_id` within a few seconds AND that the badge/popup keep showing the active account's data without seeing the older account's stale projection bleed through.
 
 ### 7b — Persistence sharding + one-time migration
 
-- Rename `predictor/Persistence/HistoryJsonlWriter.cs` paths from `history.jsonl` to `history-<account_id>.jsonl`. One writer per account, allocated lazily.
-- `HistoryJsonlReader.LoadAll` globs `history-*.jsonl` on startup and merges.
-- One-time migration: if a legacy `history.jsonl` exists on first Phase-7 launch, tag every row with the active `account_id` at that moment (we don't know the row-original account; best we can do), write to the new shard, rename the original to `history.jsonl.pre-multi-auth-backup`.
-- Acceptance: a Phase 6 install can be upgraded in place; the popover chart continues to show the user's full prior history under the active account.
+**7b (shipped, commits `1ccdd5e` + `e89b6ee`)** — per-account history shards + first-observe legacy migration.
 
-Estimated effort: 1–2 days. Runs in parallel with 7c after 7a lands.
+- `predictor/Persistence/HistoryJsonlWriter.cs` now takes an `accountId` constructor arg and writes to `history-<account_id>.jsonl`; rotation produces `history-<account_id>-<unix>.jsonl`. One writer instance per account, lazy-allocated in `Program.cs:HandleObserve`. Writer constructor validates the accountId against `^[A-Za-z0-9_]+$` to keep filenames inside the persistence root — a future protocol bug or hand-edited credential shipping `"../../evil"` would be rejected at the type boundary rather than silently escaping.
+- `HistoryJsonlReader.LoadAllByAccount` globs `history-*.jsonl`, parses the accountId from the filename (with the row's `account_id` field as fallback), and returns a per-account dict of time-ordered snapshots. The legacy un-sharded `history.jsonl` is intentionally skipped — `LegacyHistoryMigrator` owns it.
+- `PersistedSnapshot` schema bump v:1 → v:2 adds nullable `account_id`. v:1 rows still parse cleanly; the migrator stamps them with the active id at first observe and re-serialises as v:2.
+- New `LegacyHistoryMigrator`: on first observe, if `history.jsonl` is present, read all rows, tag with the observe's `account_id`, append to `history-<active>.jsonl`, rename source to `history.jsonl.pre-multi-auth-backup`. The migrator validates accountId, attempts only once per process (so a write-succeeded-but-rename-failed state doesn't trigger duplicating retries), and preserves any prior backup by timestamp-suffixing the new one if the canonical path is already taken. The post-migration log line calls out that "if you used multiple Claude accounts before this version, all their prior history is now attributed to whichever account was active on this first observe."
+- `CsmSqliteMigrator` no longer takes a `HistoryJsonlWriter` dep; writes directly to the legacy un-sharded path so its rows enter the multi-account world via the 7b migrator's first-observe re-shard.
+- `Program.cs` rewires for per-account writers (`Dictionary<string, HistoryJsonlWriter>`), per-account backfill emission at startup, first-observe migration triggering, and Add-loop seeding (not `Seed`, which would clobber the active account's window if startup had already loaded shard rows for it — caught by reviewer-pass commit `e89b6ee`).
+- 21 unit tests added across `HistoryJsonlRoundTripTests` + new `LegacyHistoryMigratorTests` + updated `CsmSqliteMigratorTests`: per-account routing (sequential and interleaved), filename regex (current shard, rotated shard, unparseable filename → row fallback), legacy migration round-trip, idempotency, append-to-pre-existing-shard, prior-backup preservation, attempted-once flag, multi-account collapse acknowledgement, accountId validation rejection. 85/85 passing.
+- **Smoke test deferred**: isolating the smoke run to a non-real `%APPDATA%` would need a new `CCUM_PERSISTENCE_ROOT` env-var override because `Environment.SpecialFolder.ApplicationData` queries the Windows shell rather than the `APPDATA` env var. Implementer chose scope discipline; the integration code follows the established 7a.3 dictionary pattern and the unit-test suite covers the new failure modes.
+
+**Acceptance** (now testable): a Phase 6 install can be upgraded in place; the popover chart continues to show the user's full prior history under the active account from ~1s after widget launch, with no gap.
 
 ### 7c — UI: popover per-account table
 
