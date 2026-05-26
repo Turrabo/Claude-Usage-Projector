@@ -72,6 +72,31 @@ public sealed class HistoryJsonlRoundTripTests : IDisposable
     }
 
     [Fact]
+    public void Writer_RejectsAccountIdsThatWouldEscapePersistenceRoot()
+    {
+        // Defends against a future protocol change or hand-edited credential
+        // putting a malicious or filename-unsafe accountId on the wire. The
+        // real accountId format is "acct_" + 12 hex chars (alphanumeric +
+        // underscore only); anything else fails ValidateAccountId.
+        foreach (var bad in new[]
+        {
+            "../../evil",
+            "with space",
+            "with-dash",      // dash isn't in real accountIds; reserved for the rotation suffix
+            "with/slash",
+            @"with\backslash",
+            "with.dot",
+            "x:y",
+            "x*y",
+        })
+        {
+            FluentActions
+                .Invoking(() => new HistoryJsonlWriter(bad, _root))
+                .Should().Throw<ArgumentException>($"accountId '{bad}' would corrupt the per-account filename scheme");
+        }
+    }
+
+    [Fact]
     public void Reader_TolersMalformedLines()
     {
         File.WriteAllText(
@@ -123,20 +148,20 @@ public sealed class HistoryJsonlRoundTripTests : IDisposable
     }
 
     [Fact]
-    public void Reader_FallsBackToRowAccountIdWhenFilenameUnmatched()
+    public void Reader_FallsBackToRowAccountIdWhenFilenameUnparseable()
     {
-        // Hand-edited / oddly-named shard: filename doesn't match the
-        // history-<account>.jsonl pattern, but rows carry an explicit
-        // account_id field. Reader should pick that up.
+        // Hand-edited / oddly-named shard: filename passes the glob
+        // (history-*.jsonl) but fails the strict regex because of the
+        // embedded dots. The reader falls back to the row's account_id
+        // field. Routing must land under AccountA (not the default
+        // sentinel) so the row isn't silently misattributed.
         File.WriteAllText(
             Path.Combine(_root, "history-renamed.weird.jsonl"),
             "{\"v\":2,\"t\":\"2026-04-01T10:00:00Z\",\"used_pct\":10.0,\"account_id\":\"" + AccountA + "\"}\n");
 
         var byAccount = new HistoryJsonlReader(_root).LoadAllByAccount(out _);
-        // Filename regex IS permissive enough to capture "renamed" so this
-        // particular file IS treated as account_id="renamed". The point of
-        // the test is that we don't silently drop usable rows.
-        byAccount.Values.SelectMany(v => v).Should().HaveCount(1);
+        byAccount.Should().ContainKey(AccountA);
+        byAccount[AccountA].Should().HaveCount(1);
     }
 
     [Fact]

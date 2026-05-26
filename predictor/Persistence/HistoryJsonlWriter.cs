@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using ClaudeUsageProjector.Predictor.State;
 
 namespace ClaudeUsageProjector.Predictor.Persistence;
@@ -23,6 +24,19 @@ public sealed class HistoryJsonlWriter : IDisposable
 {
     public const long RotationThresholdBytes = 30L * 1024 * 1024; // 30 MB per ADR-004
 
+    /// <summary>
+    /// Pattern an accountId must match before it's accepted into a filename.
+    /// Defends against a future protocol change or hand-edited credential
+    /// putting something like <c>"../../evil"</c> on the wire — Path.Combine
+    /// would happily escape the persistence root otherwise. Real accountIds
+    /// per <c>src/csm/account_id.rs</c> are <c>"acct_" + 12 hex chars</c>,
+    /// which this pattern accepts; the synthetic sentinel
+    /// <c>PersistencePaths.LegacyDefaultAccountId</c> also matches.
+    /// </summary>
+    public static readonly Regex AccountIdPattern = new(
+        @"^[A-Za-z0-9_]+$",
+        RegexOptions.Compiled);
+
     private readonly string _accountId;
     private readonly string _path;
     private readonly object _lock = new();
@@ -31,13 +45,29 @@ public sealed class HistoryJsonlWriter : IDisposable
 
     public HistoryJsonlWriter(string accountId, string? overrideRoot = null)
     {
+        ValidateAccountId(accountId);
+        _accountId = accountId;
+        var root = overrideRoot ?? PersistencePaths.Root;
+        _path = System.IO.Path.Combine(root, $"history-{accountId}.jsonl");
+    }
+
+    /// <summary>
+    /// Throws <see cref="ArgumentException"/> unless <paramref name="accountId"/>
+    /// is non-empty and matches <see cref="AccountIdPattern"/>. Public so the
+    /// legacy migrator can validate before doing any disk work.
+    /// </summary>
+    public static void ValidateAccountId(string accountId)
+    {
         if (string.IsNullOrWhiteSpace(accountId))
         {
             throw new ArgumentException("accountId must be non-empty", nameof(accountId));
         }
-        _accountId = accountId;
-        var root = overrideRoot ?? PersistencePaths.Root;
-        _path = System.IO.Path.Combine(root, $"history-{accountId}.jsonl");
+        if (!AccountIdPattern.IsMatch(accountId))
+        {
+            throw new ArgumentException(
+                $"accountId must match {AccountIdPattern} to keep persistence filenames inside the root; got '{accountId}'",
+                nameof(accountId));
+        }
     }
 
     /// <summary>The owning account this writer's file belongs to.</summary>

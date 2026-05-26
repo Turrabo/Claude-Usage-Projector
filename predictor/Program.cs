@@ -214,10 +214,18 @@ static void HandleObserve(
 
     // Phase 7b: if the pre-Phase-7b flat history.jsonl is still on disk,
     // migrate it now under THIS observe's account_id, then immediately
-    // seed the in-memory window and emit backfill for the migrated rows.
-    // First-observe timing means the user sees a populated chart within
-    // a second or two of widget launch, not the multi-second gap we'd
-    // see if migration ran at startup tagged as acct_default.
+    // populate the in-memory window and emit backfill for the migrated
+    // rows. First-observe timing means the user sees a populated chart
+    // within a second or two of widget launch, not the multi-second gap
+    // we'd see if migration ran at startup tagged as acct_default.
+    //
+    // Add() (not Seed()) preserves any rows the startup LoadAllByAccount
+    // pass already put into this account's window — Seed() calls Clear()
+    // first and would clobber them. ObservationWindow.Add doesn't dedupe
+    // by timestamp, but the (account, capturedAt) shape stays unique in
+    // practice because the only path that produces duplicates is the rare
+    // crash-between-write-and-rename in MigrateIfNeeded, which is
+    // self-correcting on a clean re-run.
     if (legacyMigrator.MigrationNeeded())
     {
         var migratedRows = legacyMigrator.MigrateIfNeeded(accountId);
@@ -228,8 +236,8 @@ static void HandleObserve(
                 seedWindow = new ObservationWindow();
                 snapshotsByAccount[accountId] = seedWindow;
             }
-            seedWindow.Seed(migratedRows, capturedAt);
-            EmitBackfill(seedWindow.Snapshots, accountId);
+            foreach (var s in migratedRows) seedWindow.Add(s);
+            EmitBackfill(migratedRows, accountId);
         }
     }
 

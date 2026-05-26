@@ -17,21 +17,30 @@ namespace ClaudeUsageProjector.Predictor.Persistence;
 /// <para/>
 /// Idempotency: once migration completes, the legacy file is renamed to
 /// <c>history.jsonl.pre-multi-auth-backup</c>. The absence of the legacy
-/// file is sufficient to mean "nothing to migrate this tick" — even if
-/// <see cref="CsmSqliteMigrator"/> later recreates the file on a future
-/// launch with fresh CSM data, the second migration just runs again
-/// against the new content.
+/// file is sufficient to mean "nothing to migrate this tick." If
+/// <see cref="CsmSqliteMigrator"/> later recreates a legacy file on a
+/// future launch (e.g. the CSM sentinel write failed and CSM re-ran),
+/// the second migration runs against the new content and writes a
+/// timestamp-suffixed backup so the original is preserved for forensic
+/// recovery.
+/// <para/>
+/// Within a single process the migrator only attempts to migrate once,
+/// even if the legacy file appears between observes — preventing log-
+/// spam retries when a write succeeded but rename failed.
 /// <para/>
 /// Failure modes (the migrator chooses safety over progress):
 /// <list type="bullet">
 ///   <item>Read fails: log warning, leave files untouched, return empty.</item>
-///   <item>Write fails part-way: the new shard may end up with duplicate
-///     timestamps, but the source file isn't renamed so the next tick can
-///     retry. The in-memory ObservationWindow tolerates duplicates by
-///     timestamp.</item>
+///   <item>Write fails part-way: the new shard may end up with rows that
+///     a follow-up retry would write again. <see cref="State.ObservationWindow"/>
+///     does NOT dedupe by timestamp, so a duplicate could bias the WLS rate
+///     fit downstream. Mitigation: the migrator suppresses retries inside
+///     the same process; a fresh launch retries once. Real-world impact is
+///     bounded to the tail of the legacy file at the moment of crash.</item>
 ///   <item>Rename fails after successful write: log loudly, return what
-///     was migrated; user can manually rename the source to avoid duplicates
-///     on next launch.</item>
+///     was migrated. The source file stays in place; next process restart
+///     will retry. The user is told this so they can manually rename to
+///     avoid duplicates if they're worried.</item>
 /// </list>
 /// </summary>
 public sealed class LegacyHistoryMigrator
@@ -40,6 +49,7 @@ public sealed class LegacyHistoryMigrator
     private readonly string _backupPath;
     private readonly string _root;
     private readonly Action<string, string>? _log;
+    private bool _attemptedThisProcess;
 
     public LegacyHistoryMigrator(
         Action<string, string>? log = null,
@@ -52,10 +62,11 @@ public sealed class LegacyHistoryMigrator
     }
 
     /// <summary>
-    /// True when the legacy file is present — i.e., migration would do work
-    /// if invoked. Cheap; safe to call on every observe.
+    /// True when the legacy file is present AND we haven't already
+    /// attempted migration in this process. Cheap; safe to call on every
+    /// observe.
     /// </summary>
-    public bool MigrationNeeded() => File.Exists(_legacyPath);
+    public bool MigrationNeeded() => !_attemptedThisProcess && File.Exists(_legacyPath);
 
     /// <summary>
     /// Migrates every parseable row from <c>history.jsonl</c> into
@@ -67,14 +78,15 @@ public sealed class LegacyHistoryMigrator
     /// </summary>
     public IReadOnlyList<UsageSnapshot> MigrateIfNeeded(string activeAccountId)
     {
-        if (string.IsNullOrWhiteSpace(activeAccountId))
-        {
-            throw new ArgumentException("activeAccountId must be non-empty", nameof(activeAccountId));
-        }
-        if (!File.Exists(_legacyPath))
+        HistoryJsonlWriter.ValidateAccountId(activeAccountId);
+        if (_attemptedThisProcess || !File.Exists(_legacyPath))
         {
             return Array.Empty<UsageSnapshot>();
         }
+        // Mark attempted up-front so a mid-flight exception doesn't trigger
+        // a retry on the next observe (which could duplicate rows that the
+        // initial write already wrote to the shard before the failure).
+        _attemptedThisProcess = true;
 
         string[] lines;
         try
@@ -124,9 +136,20 @@ public sealed class LegacyHistoryMigrator
             return Array.Empty<UsageSnapshot>();
         }
 
+        // Choose a backup destination that won't overwrite a prior backup.
+        // The default path is the canonical "history.jsonl.pre-multi-auth-backup";
+        // if that already exists (rare — only when CSM re-ran after a failed
+        // sentinel write and recreated history.jsonl), suffix with a unix
+        // timestamp so the original backup survives.
+        var backupTarget = _backupPath;
+        if (File.Exists(backupTarget))
+        {
+            var stamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            backupTarget = $"{_backupPath}-{stamp}";
+        }
         try
         {
-            File.Move(_legacyPath, _backupPath, overwrite: true);
+            File.Move(_legacyPath, backupTarget);
         }
         catch (Exception ex)
         {
@@ -134,8 +157,11 @@ public sealed class LegacyHistoryMigrator
             return migrated;
         }
 
+        var backupName = System.IO.Path.GetFileName(backupTarget);
         var skipNote = skipped > 0 ? $" (skipped {skipped} malformed)" : "";
-        _log?.Invoke("info", $"legacy-migrate: re-sharded {migrated.Count} rows under {activeAccountId}{skipNote}; legacy file backed up as history.jsonl.pre-multi-auth-backup");
+        _log?.Invoke("info",
+            $"legacy-migrate: re-sharded {migrated.Count} rows from pre-Phase-7b history.jsonl under {activeAccountId}{skipNote}; legacy file backed up as {backupName}. " +
+            "Note: if you used multiple Claude accounts before this version, all their prior history is now attributed to whichever account was active on this first observe (best-effort tagging — original row authorship isn't recoverable).");
 
         migrated.Sort((a, b) => a.CapturedAtUtc.CompareTo(b.CapturedAtUtc));
         return migrated;

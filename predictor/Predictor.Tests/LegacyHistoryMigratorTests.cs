@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Linq;
 using ClaudeUsageProjector.Predictor.Persistence;
+using ClaudeUsageProjector.Predictor.State;
 using FluentAssertions;
 using Xunit;
 
@@ -77,6 +78,22 @@ public sealed class LegacyHistoryMigratorTests : IDisposable
         var m = new LegacyHistoryMigrator(rootOverride: _root);
         FluentActions.Invoking(() => m.MigrateIfNeeded("")).Should().Throw<ArgumentException>();
         FluentActions.Invoking(() => m.MigrateIfNeeded("  ")).Should().Throw<ArgumentException>();
+        // Source file must remain untouched on validation failure — a misconfigured
+        // host shouldn't destroy data.
+        File.Exists(Path.Combine(_root, "history.jsonl")).Should().BeTrue();
+    }
+
+    [Fact]
+    public void MigrateIfNeeded_RejectsAccountIdWithInvalidChars()
+    {
+        WriteLegacy("{\"v\":1,\"t\":\"2026-04-01T10:00:00Z\",\"used_pct\":10.0}\n");
+        var m = new LegacyHistoryMigrator(rootOverride: _root);
+        foreach (var bad in new[] { "../../evil", "with space", "with-dash", "with/slash", "with\\back", "with.dot" })
+        {
+            FluentActions.Invoking(() => m.MigrateIfNeeded(bad))
+                .Should().Throw<ArgumentException>($"accountId '{bad}' must be rejected to prevent filename traversal");
+        }
+        File.Exists(Path.Combine(_root, "history.jsonl")).Should().BeTrue();
     }
 
     [Fact]
@@ -98,6 +115,91 @@ public sealed class LegacyHistoryMigratorTests : IDisposable
         // The shard from the first migration is untouched (no duplicate rows).
         var shardLines = File.ReadAllLines(Path.Combine(_root, $"history-{AccountA}.jsonl"));
         shardLines.Should().HaveCount(1);
+    }
+
+    [Fact]
+    public void MigrateIfNeeded_PreservesPriorBackupWithTimestampSuffix()
+    {
+        // Simulates the rare path where CSM re-runs after a sentinel-write
+        // failure, recreating history.jsonl with new content. The first
+        // migration's backup must not be overwritten.
+        var canonicalBackup = Path.Combine(_root, "history.jsonl.pre-multi-auth-backup");
+        File.WriteAllText(canonicalBackup, "ORIGINAL_BACKUP_CONTENT");
+
+        WriteLegacy("{\"v\":1,\"t\":\"2026-04-01T10:00:00Z\",\"used_pct\":10.0}\n");
+
+        var m = new LegacyHistoryMigrator(rootOverride: _root);
+        m.MigrateIfNeeded(AccountA);
+
+        // Canonical backup is untouched
+        File.ReadAllText(canonicalBackup).Should().Be("ORIGINAL_BACKUP_CONTENT");
+        // A timestamped backup now exists for the latest run
+        var dated = Directory.GetFiles(_root, "history.jsonl.pre-multi-auth-backup-*");
+        dated.Should().HaveCount(1, "second migration should produce a timestamp-suffixed backup so the original survives");
+    }
+
+    [Fact]
+    public void MigrateIfNeeded_OnlyAttemptsOncePerProcess()
+    {
+        // If a write succeeds but rename fails (e.g., FS held by AV), the
+        // legacy file is still on disk. We must NOT retry within the same
+        // process — that would duplicate the rows already in the shard.
+        WriteLegacy("{\"v\":1,\"t\":\"2026-04-01T10:00:00Z\",\"used_pct\":10.0}\n");
+        var m = new LegacyHistoryMigrator(rootOverride: _root);
+
+        m.MigrationNeeded().Should().BeTrue();
+        var first = m.MigrateIfNeeded(AccountA);
+        first.Should().HaveCount(1);
+
+        // After a successful first run the legacy file is gone, so this
+        // assertion is trivially true. The real protection is the
+        // _attemptedThisProcess flag — recreate the legacy file and
+        // confirm the same migrator instance refuses to re-migrate.
+        WriteLegacy("{\"v\":1,\"t\":\"2026-04-01T11:00:00Z\",\"used_pct\":20.0}\n");
+        m.MigrationNeeded().Should().BeFalse("the migrator should refuse a second attempt in the same process");
+        var second = m.MigrateIfNeeded(AccountA);
+        second.Should().BeEmpty();
+
+        // The shard still only contains the first migration's row.
+        var shard = File.ReadAllLines(Path.Combine(_root, $"history-{AccountA}.jsonl"));
+        shard.Should().HaveCount(1);
+    }
+
+    [Fact]
+    public void MigratedRows_CanBeAddedToPrePopulatedWindowWithoutClobber()
+    {
+        // Regression for the BLOCKER from Reviewer A on commit 1ccdd5e:
+        // Program.cs originally called ObservationWindow.Seed(migratedRows),
+        // which calls Clear() first. If the window already held rows from
+        // a startup LoadAllByAccount pass for the same account, those rows
+        // were silently lost in memory. The fix is to iterate Add() instead.
+        // This test verifies the contract the migrator promises: the
+        // returned rows are safe to Add into an existing window without
+        // clobbering its prior contents.
+        WriteLegacy(
+            "{\"v\":1,\"t\":\"2026-04-01T10:00:00Z\",\"used_pct\":10.0}\n" +
+            "{\"v\":1,\"t\":\"2026-04-01T10:05:00Z\",\"used_pct\":12.0}\n");
+
+        var window = new ObservationWindow();
+        // Pre-existing observation, e.g. from a prior live observe between
+        // startup and migration — same approximate timestamp range.
+        window.Add(new UsageSnapshot
+        {
+            CapturedAtUtc = new DateTimeOffset(2026, 4, 1, 9, 50, 0, TimeSpan.Zero),
+            UsedPercent = 5.0,
+            RefreshAtUtc = null,
+        });
+        var preCount = window.Count;
+        preCount.Should().Be(1);
+
+        var m = new LegacyHistoryMigrator(rootOverride: _root);
+        var rows = m.MigrateIfNeeded(AccountA);
+        foreach (var r in rows) window.Add(r);
+
+        window.Count.Should().Be(preCount + rows.Count, "Add-loop must not clobber the pre-existing snapshot");
+        window.Snapshots.Select(s => s.UsedPercent).Should().Contain(5.0);
+        window.Snapshots.Select(s => s.UsedPercent).Should().Contain(10.0);
+        window.Snapshots.Select(s => s.UsedPercent).Should().Contain(12.0);
     }
 
     [Fact]
