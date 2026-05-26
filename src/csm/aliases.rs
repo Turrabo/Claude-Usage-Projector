@@ -1,7 +1,8 @@
 // Per-account display name resolution for the popover table (Phase 7c).
 //
 // Real account ids are opaque short hashes — `acct_` + first 12 hex chars
-// of SHA-256(jwt.sub) (see DECISIONS.md ADR-011). Showing that in a table
+// of SHA-256(organizationUuid) (see DECISIONS.md ADR-011 + Appendix A).
+// Showing that in a table
 // row is hostile to the user, who knows their accounts as "Personal" or
 // "Work" or similar. The maintainer can drop a JSON file at the path
 // returned by `aliases_path()` mapping account ids to friendly names.

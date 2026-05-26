@@ -6,7 +6,7 @@
 -- coexist without collisions; INSERT OR IGNORE makes retries idempotent.
 CREATE TABLE IF NOT EXISTS observations (
     ts         INTEGER NOT NULL,            -- Unix seconds
-    account_id TEXT    NOT NULL,            -- "acct_" + first 12 hex of SHA-256(jwt.sub)
+    account_id TEXT    NOT NULL,            -- "acct_" + first 12 hex of SHA-256(organizationUuid)
     machine_id TEXT    NOT NULL,            -- stable per-machine identifier (e.g. "work-laptop")
     used_pct   REAL,                        -- 5-hour bucket % at this observation
     refresh_at INTEGER,                     -- Unix seconds when the 5-hour bucket resets

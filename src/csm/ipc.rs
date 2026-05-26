@@ -26,10 +26,12 @@ pub struct ObserveMessage<'a> {
     pub kind: &'static str,
     pub t: &'a str,
     /// Stable opaque identifier for the Claude OAuth account the cc bucket
-    /// belongs to. Derived from the JWT's `sub` claim hashed with SHA-256
-    /// (see `src/csm/account_id.rs`). `None` when the host couldn't
-    /// determine the active account — predictor side falls back to a
-    /// "default" account in that case rather than dropping the observation.
+    /// belongs to. Derived as `"acct_" + first 12 hex chars of
+    /// SHA-256(organizationUuid)` from the local credentials file (see
+    /// `src/csm/account_id.rs` and DECISIONS.md ADR-011 + Appendix A).
+    /// `None` when the host couldn't determine the active account —
+    /// predictor side falls back to a "default" account in that case
+    /// rather than dropping the observation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_id: Option<&'a str>,
     pub cc: Option<UsageBuckets>,

@@ -28,10 +28,12 @@ public sealed record ObserveMessage
 
     /// <summary>
     /// Stable opaque identifier of the Claude OAuth account the cc bucket
-    /// belongs to. Format: "acct_" + first 12 hex chars of SHA-256(jwt.sub).
-    /// Null when the host couldn't determine the active account — predictor
-    /// falls back to a default-account window rather than dropping the row.
-    /// Added in v:2 (Phase 7); v:1 messages don't carry this field.
+    /// belongs to. Format: "acct_" + first 12 hex chars of
+    /// SHA-256(organizationUuid), derived host-side from the local
+    /// credentials file. Null when the host couldn't determine the active
+    /// account — predictor falls back to a default-account window rather
+    /// than dropping the row. Added in v:2 (Phase 7); v:1 messages don't
+    /// carry this field. See DECISIONS.md ADR-011 + Appendix A.
     /// </summary>
     [JsonPropertyName("account_id")] public string? AccountId { get; init; }
 

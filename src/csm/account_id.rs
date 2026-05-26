@@ -93,14 +93,21 @@ fn credentials_path() -> Option<std::path::PathBuf> {
 }
 
 /// Extract the top-level `organizationUuid` field from the JSON content
-/// of `.credentials.json`. Returns None if the field is missing or not
-/// a string — both cases mean the credentials file doesn't have the
-/// shape we need to identify the account.
+/// of `.credentials.json`. Returns None if the field is missing, not a
+/// string, or empty/whitespace-only — all three mean the credentials
+/// file doesn't have a usable identity for the account.
 fn parse_organization_uuid(content: &str) -> Option<String> {
     let json: serde_json::Value = serde_json::from_str(content).ok()?;
-    json.get("organizationUuid")?
-        .as_str()
-        .map(str::to_string)
+    let raw = json.get("organizationUuid")?.as_str()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        // Catches the "" and "   " cases — without this guard, hashing
+        // the empty string produces a stable-but-junk id
+        // (`acct_e3b0c44298fc`, the SHA-256 of "") that masquerades as
+        // a real account.
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 #[cfg(test)]
@@ -151,6 +158,22 @@ mod tests {
     fn parse_organization_uuid_malformed_json_returns_none() {
         assert_eq!(parse_organization_uuid("not json"), None);
         assert_eq!(parse_organization_uuid(""), None);
+    }
+
+    #[test]
+    fn parse_organization_uuid_rejects_empty_and_whitespace_only_values() {
+        // Without the trim/empty guard, hashing an empty string produces
+        // `acct_e3b0c44298fc` — stable and looks real, but is junk.
+        assert_eq!(parse_organization_uuid(r#"{"organizationUuid":""}"#), None);
+        assert_eq!(parse_organization_uuid(r#"{"organizationUuid":"   "}"#), None);
+    }
+
+    #[test]
+    fn parse_organization_uuid_trims_whitespace() {
+        let r = parse_organization_uuid(
+            r#"{"organizationUuid": "  550e8400-e29b-41d4-a716-446655440000  "}"#,
+        );
+        assert_eq!(r.as_deref(), Some("550e8400-e29b-41d4-a716-446655440000"));
     }
 
     #[test]

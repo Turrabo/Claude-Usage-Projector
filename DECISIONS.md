@@ -313,7 +313,7 @@ Inspection of `.credentials.json` on a real install (structural keys only, no to
   "organizationUuid": "<uuid>" }
 ```
 
-`organizationUuid` is exactly the stable per-org identifier we need: distinct per Claude organisation, unchanged when tokens rotate, present in every credentials.json the maintainer's CLI version produces.
+`organizationUuid` looked like the right stable signal: distinct per Claude organisation, present alongside the rotating token fields, and observed unchanged across the handful of token refreshes the maintainer's machine has logged since the fix shipped. We are *assuming* it stays put across longer-horizon events (CLI version upgrades, org plan changes, manual logout/login) without having tested any of them; if any of those rotate the UUID we'll re-shard under the new id and the previous shard will look like a stale-orphaned account. Acceptable: it'd be observable in the popover table and trivially fixable by manual rename.
 
 **Revised derivation** (replaces the original "Decision" bullet on account identity):
 
@@ -331,6 +331,8 @@ Everything else in ADR-011 stays correct as written. The IPC envelope shape, the
 ### Side note (still accurate from the original ADR)
 
 `JsonlTail` data, persistence migration, IPC version-handshake, and "auth is the host's job" all hold. None of those needed changing.
+
+The original Decision bullet at line 289 says the credentials file lives at `~/.claude/credentials.json`. The actual path on disk uses a leading dot (`~/.claude/.credentials.json`) — the code in `credentials_path()` has used the leading-dot form since Phase 7a foundation. The body text of the original ADR is left as-written per the append-only ADR rule; the correct path is captured here and in the live code.
 
 ---
 

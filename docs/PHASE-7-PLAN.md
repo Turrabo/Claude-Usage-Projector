@@ -21,9 +21,9 @@ Originally scoped as one sub-milestone; split during implementation into three c
 **7a.foundation (shipped, commit `57fedbf`)** — IPC v:2 + active-account detection.
 - IPC bumped `v: 1 → v: 2` on both `predictor/Ipc/Messages.cs` and `src/csm/ipc.rs`.
 - `account_id` field added to `ObserveMessage` (host→predictor) and `PredictionMessage` (predictor→host).
-- New module `src/csm/account_id.rs` derives a stable opaque `account_id = "acct_" + sha256(jwt.sub).hex[:12]` from `~/.claude/credentials.json`. Reads on demand and caches by file mtime; no FileSystemWatcher (deferred — credentials are re-read every poll cycle naturally).
+- New module `src/csm/account_id.rs` derives a stable opaque `account_id = "acct_" + sha256(organizationUuid).hex[:12]` from `~/.claude/.credentials.json`. Reads on demand and caches by file mtime; no FileSystemWatcher (deferred — credentials are re-read every poll cycle naturally). (The original Phase 7a foundation shipped with a JWT.sub derivation per ADR-011 as written; that was corrected in commit `ba069b5` after the assumption was disproven against a real install — see ADR-011 Appendix A.)
 - `EXPECTED_PREDICTOR_VERSION` bumped 0.5.0 → 0.6.0 so the existing version-handshake catches v:1↔v:2 stale pairings (commit `08e52f2` introduced the handshake).
-- `sha2` crate added to `Cargo.toml`; base64url decode is hand-rolled in `src/csm/account_id.rs` so we didn't pull in a second crate.
+- `sha2` crate added to `Cargo.toml` for the hash.
 
 **7a.3 (shipped, commit `b15e011`)** — per-account state in the predictor.
 - `predictor/Program.cs`: `ObservationWindow` and `Tier1WeightedBurnRate` are now both `Dictionary<AccountId, …>`, lazily populated. Each account gets its own Tier1 instance because the idle-rate cache is internal and stateful — sharing across accounts would smear one account's frozen rate onto another's prediction (caught by Checkpoint 2 reviewer A).
@@ -127,7 +127,7 @@ Total estimated effort: roughly 10–15 dev-days, ~3 calendar weeks at part-time
 ## Open implementation questions (resolve during the work, not before)
 
 - **What does "account name" UI mapping look like configurationally?** A sidecar file? A new IPC message from host? Default of `acct_xxxxxxxx` is ugly. Probably a small TOML/JSON in `%APPDATA%`.
-- **What's the JWT-`sub` claim's stability across token refreshes?** Need to verify it persists when the Claude CLI refreshes the OAuth token automatically.
+- ~~**What's the JWT-`sub` claim's stability across token refreshes?**~~ — Resolved in commit `ba069b5`: the access token isn't a JWT in the first place. Identity now derives from the top-level `organizationUuid`, which is observed-stable across the maintainer's token refreshes so far. See ADR-011 Appendix A.
 - **Should the cross-machine sync also push the Hawkes-state-pending `state.json`?** ADR-012 says no (sensitivity). Confirm by re-reading the ADR before implementing 7e — easy to drift.
 - **Should the badge still cycle to a different account if the active account is `unknown` (e.g. user hasn't logged in to Claude CLI on this machine)?** Default: show "—" / "—" placeholder. Maybe make it explicit.
 
