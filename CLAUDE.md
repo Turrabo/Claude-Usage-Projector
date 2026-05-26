@@ -39,14 +39,17 @@ A daily GitHub Actions workflow (`.github/workflows/upstream-sync.yml`) attempts
 
 ## Build & toolchain
 
-The user's development machine has a corporate IT block that prevents installing MSVC C++ Build Tools. As a result:
+The maintainer's machine has VS Build Tools 2022 (17.14.x) installed at `C:\BuildTools\` (no-spaces install path — ADR-013 in [`DECISIONS.md`](DECISIONS.md) explains why that matters and which workarounds were retired). The build paths are:
 
-- **Local runnable builds**: `tools/dev-build-msvc.ps1` invokes `cargo xwin build --target x86_64-pc-windows-msvc` with LLVM-MinGW's LLD as the linker. cargo-xwin pulls the MSVC SDK from Microsoft's CDN as raw files (bypassing the IT-blocked installer). Result: a fully runnable msvc-target binary in ~10s incremental. **This is the primary local-dev path.** See [`docs/BUILD.md`](docs/BUILD.md) and ADR-010 in [`DECISIONS.md`](DECISIONS.md).
-- **Compile-check only fallback**: Rust GNU/gnullvm + LLVM-MinGW (via `tools/dev-build.ps1`). Compiles successfully but the resulting binary silently exits ~5s after startup — useful for `cargo check`/`clippy` if you don't want to invoke the full cargo-xwin pipeline.
-- **CI runnable binaries**: GitHub Actions on `windows-latest` (full MSVC pre-installed) — push a branch, download the `build-host` and `build-predictor` artifacts. Same end product as `dev-build-msvc.ps1` produces locally.
-- **C# predictor local**: works locally with just the .NET 9 SDK; `dotnet publish -c Release -r win-x64 --self-contained true /p:PublishSingleFile=true` produces a ~35 MB single-file exe with no install prerequisite for end users.
+- **Local builds (compile, test, clippy)**: `cargo build --release` against the default `stable-x86_64-pc-windows-msvc` toolchain. Source `C:\BuildTools\VC\Auxiliary\Build\vcvars64.bat` once per shell, or launch from "Developer PowerShell for VS 2022", so `cl.exe`, `link.exe`, and `rc.exe` are on `PATH`. Build time: ~27 seconds clean.
+- **CI builds**: GitHub Actions on `windows-latest` (full MSVC pre-installed). Every push to any branch triggers `build-host`; pushes touching `predictor/**` also trigger `build-predictor`. Download `ccum-host-<sha>` and `ccum-predictor-<sha>` from the Actions tab.
+- **C# predictor**: `dotnet publish predictor/Predictor.csproj -c Release -r win-x64 --self-contained true /p:PublishSingleFile=true` produces a ~36 MB single-file exe. No MSVC dependency.
 
-If you are reading this on a machine where MSVC **is** available, the simpler path is the upstream's `cargo build --release` and you can ignore both the cargo-xwin and gnullvm machinery.
+See [`docs/BUILD.md`](docs/BUILD.md) for full step-by-step instructions on each path.
+
+**Open issue — runnable host on the maintainer's machine**: as of 2026-05-26, locally-built host binaries crash with a USER32 access violation (`0xc0000005` at offset `0x35532`) within ~2 seconds of launch, while byte-identical CI artifacts run cleanly. Both cargo-xwin and native MSVC reproduce it, so the bug is in the source/build, not the toolchain. Investigation deferred; the planned next step is a `dumpbin /HEADERS` + `/LOADCONFIG` diff between the CI and local exes. Until resolved, use a CI artifact to run the widget on this machine (drop both .exes into `%LOCALAPPDATA%\Claude-Usage-Projector\` and "Start with Windows" via the tray menu).
+
+On a fresh machine without this regression, `cargo build --release` produces a runnable binary directly — no special steps.
 
 ## Phase plan (forward-looking)
 

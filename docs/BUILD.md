@@ -2,14 +2,12 @@
 
 There are two binaries: `ccum-host.exe` (Rust) and `ccum-predictor.exe` (C# / .NET 9). They are designed to live side-by-side in the same folder at runtime. The host spawns the predictor as a child process; if the predictor isn't co-located the host runs fine but the sidecar is a silent no-op.
 
-This guide covers four workflows:
+Two supported workflows:
 
-1. [Building on a machine with MSVC available](#standard-msvc-path) — the simple path
-2. [Building locally without MSVC via cargo-xwin](#no-msvc-runnable-cargo-xwin-path) — runnable local binaries on a machine that can't install MSVC Build Tools (the main developer machine)
-3. [Building locally without MSVC via gnullvm](#no-msvc-compile-check-gnullvm-path) — compile-check only, kept as a fallback (the binary doesn't launch — see ADR-005)
-4. [Using CI-built artifacts](#ci-artifact-path) — when neither local path applies, or for clean reproducible builds
+1. [Building locally with MSVC](#standard-msvc-path) — the canonical path
+2. [Using CI-built artifacts](#ci-artifact-path) — for clean reproducible builds, machines without MSVC, or the maintainer's machine while the USER32 regression (see ADR-013) remains open
 
-If you are not the project maintainer on the specific machine where it was set up, you almost certainly want path (1) or (4).
+Earlier revisions of this guide also described a cargo-xwin path and a gnullvm path; both were retired on 2026-05-26 when VS Build Tools turned out to install fine after all (the prior "MSVC blocked by IT" diagnosis was a PowerShell argument-quoting bug; see ADR-013). The history of those workarounds is preserved in ADR-005, ADR-010, and ADR-013 in [`../DECISIONS.md`](../DECISIONS.md).
 
 ---
 
@@ -18,22 +16,27 @@ If you are not the project maintainer on the specific machine where it was set u
 **Prerequisites**
 
 - Windows 10/11
-- [Rust](https://rustup.rs/) (stable, x86_64-pc-windows-msvc)
-- [Visual Studio Build Tools 2022](https://visualstudio.microsoft.com/downloads/?q=build+tools) with the **"Desktop development with C++"** workload
+- [Rust](https://rustup.rs/) (stable, x86_64-pc-windows-msvc — rustup's default on Windows)
+- [Visual Studio Build Tools 2022](https://visualstudio.microsoft.com/downloads/?q=build+tools) with the **"Desktop development with C++"** workload. **Install to a path without spaces** if you're invoking `setup.exe` via `Start-Process -Verb RunAs` from a script — PowerShell's elevation arg handling silently truncates spaced paths at the first space. The maintainer's machine uses `C:\BuildTools\`. See ADR-013 for the rabbit hole this caused.
 - [.NET 9 SDK](https://dotnet.microsoft.com/download/dotnet/9.0)
 
 **Build the host**
 
+Source the MSVC environment first so `cl.exe`, `link.exe`, `rc.exe` are on `PATH` and `INCLUDE`/`LIB` are set. Adjust the path for your install location (the maintainer's is `C:\BuildTools\`):
+
 ```powershell
+& 'C:\BuildTools\VC\Auxiliary\Build\vcvars64.bat'
+# ...or launch directly from the "Developer PowerShell for VS 2022" shortcut.
+
 cargo build --release
-# Produces target/release/claude-code-usage-monitor.exe
+# Produces target/release/claude-code-usage-monitor.exe (~1 MB, with icon and version metadata)
 ```
 
 **Build the predictor**
 
 ```powershell
 dotnet publish predictor/Predictor.csproj -c Release -r win-x64 --self-contained true /p:PublishSingleFile=true
-# Produces predictor/bin/Release/net9.0/win-x64/publish/ccum-predictor.exe
+# Produces predictor/bin/Release/net9.0/win-x64/publish/ccum-predictor.exe (~36 MB)
 ```
 
 **Run**
@@ -47,111 +50,11 @@ target/release/claude-code-usage-monitor.exe --diagnose
 
 The widget should appear in your taskbar. Add `--diagnose` to log to `%TEMP%\claude-code-usage-monitor.log`.
 
----
+### Known issue — maintainer's machine only
 
-## No-MSVC runnable (cargo-xwin) path
+As of 2026-05-26, locally-built host binaries on the project maintainer's specific Windows 11 install crash with a USER32 access violation (`0xc0000005` at offset `0x35532`) within ~2 seconds of launch. CI-built binaries of byte-identical source run cleanly. Both cargo-xwin and native MSVC reproduce the crash, so it's not a toolchain issue — investigation is via PE-header diff (`dumpbin /HEADERS` + `/LOADCONFIG`), deferred.
 
-If `Microsoft.VisualStudio.2022.BuildTools` cannot be installed on your machine (corporate IT block, AV interference, or any other reason — symptoms: the bootstrapper runs and downloads dependencies but the `Microsoft.VC.Tools.*` payload never lands, `vswhere` reports no installations), use this path. It produces a **runnable** MSVC-target binary in ~10s incremental, ~30s clean — same as `cargo build --release` would on a machine with MSVC installed.
-
-The trick: `cargo-xwin` downloads the MSVC SDK headers + libraries directly from Microsoft's CDN as raw files (bypassing the installer bootstrapper that the corporate block typically targets) and uses LLVM-MinGW's `lld` as the linker. The CDN raw-file downloads pass through the same network controls that allow normal HTTPS to Microsoft from a browser.
-
-**Prerequisites**
-
-- Windows 10/11 with admin-on-demand (UAC) available
-- Rust + LLVM-MinGW already installed (same as the gnullvm path below)
-- The Rust gnullvm toolchain with the msvc target added:
-  ```powershell
-  rustup target add x86_64-pc-windows-msvc --toolchain stable-x86_64-pc-windows-gnullvm
-  ```
-- `xwin` and `cargo-xwin` installed via the gnullvm toolchain (because installing under msvc fails without link.exe):
-  ```powershell
-  cargo +stable-x86_64-pc-windows-gnullvm install --locked --target x86_64-pc-windows-gnullvm xwin
-  cargo +stable-x86_64-pc-windows-gnullvm install --locked --target x86_64-pc-windows-gnullvm cargo-xwin
-  ```
-- The MSVC SDK populated into cargo-xwin's cache. This step is **one-time** and needs admin (UAC) to create one version-pointer symlink inside the SDK directory:
-  ```powershell
-  # In an ELEVATED PowerShell, once per machine:
-  xwin --accept-license splat --output "$env:LOCALAPPDATA\cargo-xwin\xwin"
-  ```
-
-**Build**
-
-```powershell
-./tools/dev-build-msvc.ps1
-# Produces target/x86_64-pc-windows-msvc/release/claude-code-usage-monitor.exe (~0.82 MB, runnable)
-```
-
-The script handles three things the bare `cargo xwin build` invocation doesn't:
-- Creates an `lld-link.exe` shim in `~/.cargo/bin` (LLVM-MinGW ships `ld.lld.exe` but Rust's msvc target expects `lld-link.exe` — same binary, different driver-mode name)
-- Adds LLVM-MinGW to `PATH` so cargo-xwin's `--cross-compiler clang` finds clang
-- Sets `SKIP_WINRES=1` so `build.rs` skips the icon + version-metadata embed (which needs Microsoft's `rc.exe`, not in the xwin SDK)
-
-**Build the predictor**
-
-Unaffected by the MSVC block. Same command as the standard path:
-
-```powershell
-dotnet publish predictor/Predictor.csproj -c Release -r win-x64 --self-contained true /p:PublishSingleFile=true
-```
-
-**Run**
-
-Pair the host with any recent `ccum-predictor.exe` (a CI artifact works fine if you don't want to rebuild the predictor each time) and launch with `--diagnose`. The widget should appear in the taskbar identically to a CI-built binary.
-
----
-
-## No-MSVC compile-check (gnullvm) path
-
-This is the older fallback. The binary compiles successfully but **does not launch correctly** (silently exits ~5s after startup — see [DECISIONS.md ADR-005](../DECISIONS.md) and [the gnullvm runtime bug section below](#known-limitation-gnullvm-binary-doesnt-launch)). Useful for `cargo check`, `cargo clippy`, and editor type-checking when you don't want to invoke the full cargo-xwin pipeline. For runnable binaries, use the cargo-xwin path above.
-
-**Prerequisites**
-
-- Windows 10/11
-- [.NET 9 SDK](https://dotnet.microsoft.com/download/dotnet/9.0)
-- Install Rust:
-  ```powershell
-  winget install Rustlang.Rustup
-  ```
-- Install LLVM-MinGW (provides `windres`, `dlltool`, `gcc`, `lld`):
-  ```powershell
-  winget install MartinStorsjo.LLVM-MinGW.UCRT
-  ```
-- Install the Rust gnullvm toolchain:
-  ```powershell
-  rustup toolchain install stable-x86_64-pc-windows-gnullvm
-  rustup override set stable-x86_64-pc-windows-gnullvm
-  ```
-
-**Build the host**
-
-```powershell
-./tools/dev-build.ps1
-# Produces target/release/claude-code-usage-monitor.exe (compile-only — see limitation below)
-```
-
-The script temporarily renames LLVM-MinGW's `libunwind.dll.a` so the linker is forced to statically link `libunwind` instead — without this, the resulting binary has a `libunwind.dll` runtime dependency, and even with it, see the next section.
-
-**Build the predictor**
-
-Unaffected by the MSVC block. Same command as the standard path:
-
-```powershell
-dotnet publish predictor/Predictor.csproj -c Release -r win-x64 --self-contained true /p:PublishSingleFile=true
-```
-
-### Known limitation: gnullvm binary doesn't launch
-
-The host binary built via the gnullvm path compiles, links, runs through its startup sequence, gets to `tray event hook installed` in the diagnose log, then silently exits ~5 seconds later — before reaching `position_at_taskbar` and `ShowWindow`. The same source built with MSVC (CI artifact, or any machine with VS Build Tools) launches and runs normally. Most likely cause is an ABI mismatch in Win32 callback dispatch through statically linked compiler-rt + libunwind. Not pursued further because the CI path solves it without further work.
-
-So the gnullvm path is useful for:
-
-- `cargo check`, `cargo clippy`, type-checking
-- Verifying compilation succeeds after edits
-- Smoke-testing the predictor + IPC contract (the predictor exe works fine locally; you can pipe JSON observations into it from the command line)
-
-Not useful for:
-
-- Actually running the host widget locally — use a CI artifact for that.
+If you hit this on a fresh Windows install, please open an issue with the diagnose log. As a workaround, use the CI artifact path below.
 
 ---
 
@@ -199,7 +102,7 @@ After the host launches, the diagnose log at `%TEMP%\claude-code-usage-monitor.l
 [<ts>] csm: predictor sidecar started
 [<ts>] window shown
 [<ts>] initial poll thread started
-[<ts>] predictor[info] ccum-predictor v0.5.0 started (pid=<n>)
+[<ts>] predictor[info] ccum-predictor v0.6.0 started (pid=<n>)
 [<ts>] predictor[info] observed @ <iso8601>  cc 5h=<x>% 7d=<y>%  cx=<z|none>
 [<ts>] predictor[pred] tier=2 risk=... used=...% rate=...%/min p50=... pE=... stale=... act=...
 ```
