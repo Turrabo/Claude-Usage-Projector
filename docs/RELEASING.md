@@ -62,4 +62,4 @@ Compress-Archive -Path "release-stage/*" -DestinationPath "ccum-windows-x64-v0.5
 # 4. Upload to a Release manually via the GitHub UI or `gh release create`.
 ```
 
-Bear in mind: this snippet assumes the standard MSVC toolchain. If you're on a machine without MSVC, use the cargo-xwin path (`tools/dev-build-msvc.ps1` — see [`BUILD.md`](BUILD.md) and ADR-010) for a runnable local binary, or just trigger CI. The older gnullvm compile-check path produces a binary that doesn't launch and is not suitable for releases.
+Bear in mind: this snippet assumes the standard MSVC toolchain (see [`BUILD.md`](BUILD.md)). If you're on a machine without MSVC, trigger CI by pushing your branch and use the resulting artifacts. The earlier cargo-xwin and gnullvm workarounds described in ADR-005 and ADR-010 were retired in ADR-013 (2026-05-26) — both paths produced binaries that either didn't launch or crashed shortly after launch, so neither was ever suitable for releases.

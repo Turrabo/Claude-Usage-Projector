@@ -1,12 +1,6 @@
-# Intentionally minimal. Earlier revisions of this file pinned the
-# `WINRES_TOOLCHAIN` env var to a specific user's LLVM-MinGW install path,
-# which broke for anyone else and rotted on every LLVM-MinGW version bump.
-# The build scripts now derive that path at runtime:
-#   - `tools/dev-build.ps1` for the gnullvm compile-check path (which is the
-#     only path that actually needs WINRES_TOOLCHAIN — `winres` only consults
-#     it on gnu/gnullvm targets).
-#   - `tools/dev-build-msvc.ps1` for the cargo-xwin runnable path doesn't
-#     need it: msvc-target builds run with `SKIP_WINRES=1`.
-#
-# Leave this file in place (with no entries) so future fork-specific cargo
-# config has an obvious home.
+# Intentionally minimal. Retained as an obvious home for any future
+# fork-specific cargo config. The canonical local build is plain
+# `cargo build --release` against the default `stable-x86_64-pc-windows-msvc`
+# toolchain (see ADR-013 in DECISIONS.md); no cargo config overrides are
+# needed for it. Earlier revisions pinned `WINRES_TOOLCHAIN` for the now-
+# retired gnullvm path — preserved in ADR-005 Appendix A if ever needed.

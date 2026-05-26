@@ -56,7 +56,7 @@ On a fresh machine without this regression, `cargo build --release` produces a r
 | Phase | Status | Scope |
 |---|---|---|
 | 0 | ✅ shipped | Fork scaffold: CI workflows (`build-host`, `build-predictor`, `upstream-sync`), predictor csproj skeleton |
-| 0.5 | ✅ shipped | Local gnullvm dev pipeline (`tools/dev-build.ps1`, `.cargo/config.toml`) |
+| 0.5 | ✅ shipped | Local gnullvm dev pipeline (retired 2026-05-26 in ADR-013; see ADR-005 + Appendix A for the libunwind static-link recipe if ever needed) |
 | 1 | ✅ shipped | Predictor sidecar IPC plumbing: spawn/supervise, line-delimited JSON contract, observation forwarding |
 | 2 | ✅ shipped | Port **Tier 1** (linear burn rate) and **Tier 2** (Monte Carlo) predictor from CSM; predictor emits real `prediction` messages |
 | 3 | ✅ shipped | Port **JSONL tail adapter** and **Tier 3 Hawkes** burst model; predictions become rhythm-aware |
