@@ -1,13 +1,14 @@
 name: build-predictor
 
-# Build the C# predictor sidecar binary on every push to a non-main branch
-# and on manual dispatch. Self-contained single-file publish (no AOT, no
-# MSVC dependency). Artifact is the ~35 MB ccum-predictor.exe.
+# Build the C# predictor sidecar binary on every push (any branch, including
+# main) that touches the predictor or this workflow file, and on manual
+# dispatch. Builds on main catch regressions from direct-push changes
+# (previously this trigger ignored main — see ADR-013).
+# Self-contained single-file publish (no AOT, no MSVC dependency).
+# Artifact is the ~36 MB ccum-predictor.exe.
 
 on:
   push:
-    branches-ignore:
-      - main
     paths:
       - 'predictor/**'
       - '.github/workflows/build-predictor.yml'

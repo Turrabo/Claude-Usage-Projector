@@ -1,13 +1,13 @@
 name: build-host
 
-# Build the Rust host binary on every push to a non-main branch, and on
-# manual dispatch. Used for dev iteration on a machine without local MSVC
-# tooling — pull the artifact down and run it locally to test.
+# Build the Rust host binary on every push (any branch, including main) and
+# on manual dispatch. Builds on main are the canonical regression-catcher
+# for changes that landed via direct push; previously this trigger ignored
+# main, which masked a USER32 0x35532 regression for several days in May
+# 2026 (see ADR-013).
 
 on:
   push:
-    branches-ignore:
-      - main
   workflow_dispatch:
 
 permissions:
