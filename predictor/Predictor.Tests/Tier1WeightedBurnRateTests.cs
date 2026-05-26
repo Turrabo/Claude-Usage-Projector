@@ -268,4 +268,82 @@ public sealed class Tier1WeightedBurnRateTests
         t1.Tier.Should().Be(1);
         t2.Tier.Should().Be(2);
     }
+
+    [Fact]
+    public void TwoSnapshots_OneMinuteApart_NoRateFromColdStartGuard()
+    {
+        // The post-account-switch case: the user has just switched to a
+        // new Claude account, and the per-account ObservationWindow only
+        // has 2 samples taken 60 seconds apart. WLS rejects (span 1 <
+        // MinSpanMinutes 5). The RateOverWindow fallback used to emit a
+        // wildly noisy endpoint rate from any 2 samples; the cold-start
+        // guard now requires >=3 samples AND >=2 minutes of span before
+        // emitting a rate, so the projection stays blank until enough
+        // data has accrued.
+        var p = Predictor();
+        var now = new DateTimeOffset(2026, 4, 25, 12, 0, 0, TimeSpan.Zero);
+        var refreshAt = now.AddHours(4);
+        var snapshots = new[]
+        {
+            Snap(now.AddMinutes(-1), 23, refreshAt),
+            Snap(now,                24, refreshAt)
+        };
+
+        var result = p.Compute(snapshots, now);
+
+        result.UsedPercent.Should().Be(24);
+        result.WeightedBurnRate.Should().BeNull();
+        result.ProjectedEmptyP50AtUtc.Should().BeNull();
+    }
+
+    [Fact]
+    public void ThreeSnapshots_JustUnderTwoMinutes_StillBelowColdStartThreshold()
+    {
+        // Negative-boundary case: 3 samples spanning only 1.9 minutes —
+        // count guard is satisfied (>=3) but span guard rejects
+        // (< MinRateSpanMinutes 2.0). No rate emitted.
+        var p = Predictor();
+        var now = new DateTimeOffset(2026, 4, 25, 12, 0, 0, TimeSpan.Zero);
+        var refreshAt = now.AddHours(4);
+        var snapshots = new[]
+        {
+            Snap(now.AddSeconds(-114), 23, refreshAt),
+            Snap(now.AddSeconds(-57),  24, refreshAt),
+            Snap(now,                  25, refreshAt)
+        };
+        // Span: 114s = 1.9 min — strictly less than the 2.0 min threshold.
+
+        var result = p.Compute(snapshots, now);
+
+        result.WeightedBurnRate.Should().BeNull();
+        result.ProjectedEmptyP50AtUtc.Should().BeNull();
+        result.Reason.Should().Contain("Warming up");
+    }
+
+    [Fact]
+    public void ThreeSnapshots_OverTwoMinutes_EmitsRateViaRateOverWindow()
+    {
+        // Threshold case: exactly 3 samples spanning exactly 2 minutes —
+        // the cold-start guard's lower bound. WLS still fails (span 2 < 5)
+        // but the endpoint-rate fallback now activates because both guards
+        // are satisfied. Proves the warm-up period ends at ~2 minutes of
+        // polling after an account switch.
+        var p = Predictor();
+        var now = new DateTimeOffset(2026, 4, 25, 12, 0, 0, TimeSpan.Zero);
+        var refreshAt = now.AddHours(4);
+        var snapshots = new[]
+        {
+            Snap(now.AddMinutes(-2), 23, refreshAt),
+            Snap(now.AddMinutes(-1), 24, refreshAt),
+            Snap(now,                25, refreshAt)
+        };
+
+        var result = p.Compute(snapshots, now);
+
+        result.UsedPercent.Should().Be(25);
+        result.WeightedBurnRate.Should().NotBeNull();
+        // 2% over 2 minutes = 1.0 %/min from each window (5/15/30), so the
+        // weighted average across present rates is also 1.0.
+        result.WeightedBurnRate!.Value.Should().BeApproximately(1.0, 1e-6);
+    }
 }

@@ -69,6 +69,7 @@ Total ~2.5 hours across two commits, not one (split decided after the verificati
 - The genuine cross-machine sync (Phase 7e in [`PHASE-7-PLAN.md`](PHASE-7-PLAN.md)). The chart will still be empty for an account the user has never used on this machine, even after this fix. Phase 7e fills in the actual data; this fix just stops the chart from lying about what it has.
 - The local-build USER32 crash documented in the auto-memory. Orthogonal.
 - The Phase 7b history sharding (still pending). The fix sits cleanly on top of either pre- or post-7b state — it only reads `history`, doesn't care where it came from.
+- **Bimodal samples within the 2-min cold-start window** (flagged by reviewer during Task B). `RateOverWindow` uses only `earliest` and `latest` percent values, not the intermediate samples. A post-switch sequence like `23% → 50% → 24% → 25%` (transient spike at the first sample) would yield a clean `(25-23)/2 = 1.0 %/min` and silently discard the genuine outlier. Worth a future improvement: drop a single-sample outlier filter into `RateOverWindow`, or compute a median pairwise rate over `inWindow` rather than the endpoints. Out of scope here; mentioned only so the next reader knows the cold-start gate isn't a full outlier shield.
 
 ## Open implementation questions
 

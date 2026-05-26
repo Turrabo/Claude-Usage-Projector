@@ -27,12 +27,30 @@ namespace ClaudeUsageProjector.Predictor.Tiers;
 /// rate has decayed below half the most recent active-mode rate, return the
 /// cached active rate instead — projection then reflects "expected rate when
 /// the user resumes prompting" rather than collapsing toward zero.
+/// <para/>
+/// Cold-start gate: the endpoint-rate fallback path (<c>RateOverWindow</c>)
+/// requires <c>MinSamplesForRate</c> (3) samples AND <c>MinRateSpanMinutes</c>
+/// (2.0) of span before emitting a rate. Below either threshold the rate is
+/// dominated by single-poll noise; emitting it would produce a wildly wrong
+/// projection for the first minute or two after an account switch (where the
+/// per-account ObservationWindow only just started accumulating data).
 /// </summary>
 public sealed class Tier1WeightedBurnRate
 {
     private const double HalfLifeMinutes = 20.0;
     private const double MinSpanMinutes = 5.0;
     private const double ResetThresholdPercent = 10.0;
+
+    // Cold-start guards for the RateOverWindow fallback path. WLS already
+    // has its own MinSpanMinutes (above) for the primary regression; these
+    // gate the simpler endpoint-rate fallback. With <3 samples or <2 min
+    // of span, the endpoint-rate is dominated by single-poll noise and
+    // produces a wildly wrong projection for the first minute or two
+    // after an account switch (where the per-account ObservationWindow
+    // only just started accumulating samples). See
+    // docs/ACCOUNT-SWITCH-COLDSTART-FIX.md Task B.
+    private const int MinSamplesForRate = 3;
+    private const double MinRateSpanMinutes = 2.0;
 
     private const double IdleFreezeRatio = 0.5;
     private const double IdleCacheTtlMinutes = 120.0;
@@ -170,7 +188,17 @@ public sealed class Tier1WeightedBurnRate
         }
         else if (!weighted.HasValue)
         {
-            reason = "Insufficient rate data";
+            // Differentiate the cold-start case (2+ samples but the
+            // RateOverWindow guard rejected — usually post account switch)
+            // from the genuine "we just don't have data yet" case
+            // (0 or 1 samples). The diagnose log carries the right hint.
+            var coldStart = currentSnaps.Count >= 2
+                && (currentSnaps.Count < MinSamplesForRate
+                    || (currentSnaps[^1].CapturedAtUtc - currentSnaps[0].CapturedAtUtc).TotalMinutes
+                        < MinRateSpanMinutes);
+            reason = coldStart
+                ? "Warming up -- need more samples or a longer span"
+                : "Insufficient rate data";
         }
 
         var projectedBeforeRefresh = latest.RefreshAtUtc.HasValue
@@ -337,11 +365,11 @@ public sealed class Tier1WeightedBurnRate
     {
         var cutoff = latest.CapturedAtUtc - window;
         var inWindow = snapshots.Where(s => s.CapturedAtUtc >= cutoff && s.UsedPercent.HasValue).ToList();
-        if (inWindow.Count < 2) return null;
+        if (inWindow.Count < MinSamplesForRate) return null;
 
         var earliest = inWindow[0];
         var minutes = (latest.CapturedAtUtc - earliest.CapturedAtUtc).TotalMinutes;
-        if (minutes <= 0) return null;
+        if (minutes < MinRateSpanMinutes) return null;
 
         var delta = latest.UsedPercent!.Value - earliest.UsedPercent!.Value;
         var rate = delta / minutes;
