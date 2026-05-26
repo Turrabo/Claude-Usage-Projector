@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Text.Json;
 using ClaudeUsageProjector.Predictor.Activity;
 using ClaudeUsageProjector.Predictor.Adapters;
@@ -9,24 +10,33 @@ using ClaudeUsageProjector.Predictor.Projection;
 using ClaudeUsageProjector.Predictor.State;
 using ClaudeUsageProjector.Predictor.Tiers;
 
-// ccum-predictor — Phase 5 wiring.
+// ccum-predictor — Phase 7b wiring.
 //
 // Reads line-delimited JSON messages from stdin:
-//   {"v":1,"type":"observe","t":"...","cc":{...},"cx":null}
-//   {"v":1,"type":"shutdown"}
+//   {"v":2,"type":"observe","t":"...","account_id":"acct_...","cc":{...},"cx":null}
+//   {"v":2,"type":"shutdown"}
 //
 // On each observe we update the rolling snapshot window, persist the new
-// observation to history.jsonl, run Tier 1/2/3, and emit a prediction. In
-// parallel the JSONL tail feeds Claude Code session events into the
-// telemetry window for activity-mode classification and Hawkes intensity.
+// observation to its per-account history shard, run Tier 1/2/3, and emit a
+// prediction. In parallel the JSONL tail feeds Claude Code session events
+// into the telemetry window for activity-mode classification and Hawkes
+// intensity.
 //
-// On startup we restore prior state in two ways:
-//   1. Any rows in %APPDATA%/Claude-Code-Usage-Monitor/predictor/history*.jsonl
-//      are loaded into the ObservationWindow (CSM SQLite is migrated into
-//      that file on first run as a one-time bootstrap).
-//   2. The JSONL tail seeds each session file's offset to the position of
+// On startup we restore prior state in three ways:
+//   1. Any rows in per-account shards
+//      %APPDATA%/Claude-Code-Usage-Monitor/predictor/history-<account>.jsonl
+//      are loaded per account into their own ObservationWindow.
+//   2. The pre-Phase-7b flat history.jsonl (if present) is migrated on the
+//      first observe — see LegacyHistoryMigrator. Each row is tagged with
+//      the active account_id the host supplies on that observe, and re-
+//      sharded into history-<active>.jsonl. The legacy file is renamed to
+//      history.jsonl.pre-multi-auth-backup.
+//   3. The JSONL tail seeds each session file's offset to the position of
 //      the first line whose timestamp is newer than now - 6h, so Hawkes
 //      doesn't have to re-warm from cold on every relaunch.
+// CSM SQLite migration (one-time first-run bootstrap from the predecessor
+// project) writes its rows into the legacy un-sharded history.jsonl; the
+// Phase 7b migrator picks them up on the next observe.
 
 PersistencePaths.EnsureRootExists();
 
@@ -37,6 +47,9 @@ PersistencePaths.EnsureRootExists();
 // would smear account A's frozen rate onto account B's prediction. See
 // DECISIONS.md ADR-011 for the model.
 //
+// Phase 7b: HistoryJsonlWriter is also per-account, keyed by accountId.
+// Each writer owns its own history-<account>.jsonl file.
+//
 // TelemetryWindow + JsonlActivityDetector + the Hawkes scaler stay
 // shared across accounts: they reflect this machine's session-timing
 // data, which ADR-011 explicitly keeps machine-scoped (JsonlTail events
@@ -46,74 +59,48 @@ PersistencePaths.EnsureRootExists();
 // serialise naturally.
 var snapshotsByAccount = new Dictionary<string, ObservationWindow>();
 var tiersByAccount = new Dictionary<string, Tier1WeightedBurnRate>();
+var writersByAccount = new Dictionary<string, HistoryJsonlWriter>();
 var telemetry = new TelemetryWindow();
 var activityDetector = new JsonlActivityDetector();
 var monteCarlo = new MonteCarloProjectionEngine();
 var hawkesScaler = new DefaultHawkesIntensityScaler();
 var predictorOptions = new PredictorOptions();
+var legacyMigrator = new LegacyHistoryMigrator(Log);
 
-// Sentinel for observations that arrive without an account_id (v:1 host
-// paired with v:2 predictor, or the host couldn't read credentials.json).
-// On startup we also load all pre-v:2 persisted history under this id;
-// Phase 7b will migrate it to per-account shards via a tagged rewrite.
-const string DefaultAccountId = "acct_default";
-
-var historyWriter = new HistoryJsonlWriter();
-
-// One-time-at-first-run migration from the CSM SQLite database.
-var migrator = new CsmSqliteMigrator(historyWriter, Log);
-var migrated = migrator.MigrateIfNeeded();
+// One-time-at-first-run migration from the CSM SQLite database. Writes to
+// the legacy un-sharded history.jsonl path; the Phase 7b migrator will
+// re-shard it on first observe under the active account_id.
+var csmMigrator = new CsmSqliteMigrator(Log);
+var migrated = csmMigrator.MigrateIfNeeded();
 if (migrated is int m && m > 0)
 {
-    Log("info", $"persistence: seeded {m} rows from CSM SQLite");
+    Log("info", $"persistence: seeded {m} rows from CSM SQLite into legacy history.jsonl (will re-shard on first observe)");
 }
 
-// Restore the in-memory window from disk so the popup chart survives reboots.
-// Phase 7a.3: all persisted rows go under DefaultAccountId because the
-// flat history.jsonl format pre-dates per-account sharding. The next
-// observe with a real account_id will create that account's own window
-// and live data accrues there. Backfill predictions thus tag as
-// DefaultAccountId and land in the host's prediction_store under the
-// same bucket (Phase 7a.4, commit ca6e285). Until Phase 7b shards
-// history.jsonl per account and retags legacy rows, a real-account
-// user's popover briefly shows an empty chart on first launch while
-// the backfill sits orphaned under DefaultAccountId.
+// Restore the in-memory windows from per-account shards so the popup chart
+// survives reboots. Phase 7b: rows already in shards belong to known
+// accounts; the legacy un-sharded file (if present) is left for first-
+// observe migration so it can be tagged with the active account_id.
 var reader = new HistoryJsonlReader();
-var persisted = reader.LoadAll(out var skipped);
-if (persisted.Count > 0)
+var byAccount = reader.LoadAllByAccount(out var skipped);
+int totalLoaded = 0;
+foreach (var (accountId, persisted) in byAccount)
 {
-    var defaultSnapshots = new ObservationWindow();
-    defaultSnapshots.Seed(persisted, DateTimeOffset.UtcNow);
-    snapshotsByAccount[DefaultAccountId] = defaultSnapshots;
-    Log("info", $"persistence: loaded {persisted.Count} snapshots (skipped {skipped} malformed) into {DefaultAccountId}");
+    if (persisted.Count == 0) continue;
+    var window = new ObservationWindow();
+    window.Seed(persisted, DateTimeOffset.UtcNow);
+    snapshotsByAccount[accountId] = window;
+    totalLoaded += persisted.Count;
 
-    // Replay loaded snapshots to the host as tier=0 ("backfill") prediction
-    // messages so the popup's history line is populated immediately on a
-    // fresh launch. The host's prediction_store sees tier=0 and pushes only
-    // to history, leaving `latest` untouched for the live prediction that
-    // arrives on the next observe.
-    foreach (var s in defaultSnapshots.Snapshots)
-    {
-        if (!s.UsedPercent.HasValue) continue;
-        var backfill = new PredictionMessage
-        {
-            TimestampUtc = FormatUtc(s.CapturedAtUtc),
-            Tier = 0,
-            Risk = "unknown",
-            Stale = false,
-            UsedPercent = s.UsedPercent,
-            RefreshAtUtc = s.RefreshAtUtc is { } r ? FormatUtc(r) : null,
-            ProbabilityEmptyBeforeRefresh = 0.0,
-            AccountId = DefaultAccountId,
-        };
-        var backfillLine = JsonSerializer.Serialize(backfill, IpcJsonContext.Default.PredictionMessage);
-        Console.Out.WriteLine(backfillLine);
-    }
-    Console.Out.Flush();
+    EmitBackfill(window.Snapshots, accountId);
+}
+if (totalLoaded > 0)
+{
+    Log("info", $"persistence: loaded {totalLoaded} snapshots across {snapshotsByAccount.Count} account shard(s) (skipped {skipped} malformed)");
 }
 else if (skipped > 0)
 {
-    Log("warn", $"persistence: no usable rows ({skipped} malformed lines)");
+    Log("warn", $"persistence: no usable rows in any shard ({skipped} malformed lines)");
 }
 
 var jsonlRoot = JsonlTail.DefaultRoot();
@@ -155,12 +142,12 @@ while ((line = Console.In.ReadLine()) is not null)
         switch (messageType)
         {
             case "observe":
-                HandleObserve(line, snapshotsByAccount, tiersByAccount, predictorOptions, monteCarlo, hawkesScaler, telemetry, activityDetector, historyWriter);
+                HandleObserve(line, snapshotsByAccount, tiersByAccount, writersByAccount, legacyMigrator, predictorOptions, monteCarlo, hawkesScaler, telemetry, activityDetector);
                 break;
             case "shutdown":
                 Log("info", "shutdown received");
                 tail?.Dispose();
-                historyWriter.Dispose();
+                DisposeAllWriters(writersByAccount);
                 return;
             default:
                 Log("warn", $"unknown message type: {messageType}");
@@ -171,7 +158,7 @@ while ((line = Console.In.ReadLine()) is not null)
 
 Log("info", "stdin closed; exiting");
 tail?.Dispose();
-historyWriter.Dispose();
+DisposeAllWriters(writersByAccount);
 return;
 
 
@@ -179,12 +166,13 @@ static void HandleObserve(
     string rawLine,
     Dictionary<string, ObservationWindow> snapshotsByAccount,
     Dictionary<string, Tier1WeightedBurnRate> tiersByAccount,
+    Dictionary<string, HistoryJsonlWriter> writersByAccount,
+    LegacyHistoryMigrator legacyMigrator,
     PredictorOptions predictorOptions,
     MonteCarloProjectionEngine monteCarlo,
     IHawkesIntensityScaler hawkesScaler,
     TelemetryWindow telemetry,
-    IActivityDetector detector,
-    HistoryJsonlWriter writer)
+    IActivityDetector detector)
 {
     ObserveMessage? observe;
     try
@@ -218,12 +206,32 @@ static void HandleObserve(
         : $"cx 5h={observe.Codex.FiveHourPct:0.0}% 7d={observe.Codex.SevenDayPct:0.0}%";
     // Phase 7a.3: route observations to per-account windows. Missing
     // account_id (v:1 host or unreadable credentials) routes to the
-    // top-level `DefaultAccountId` sentinel so we never drop data.
-    var accountId = observe.AccountId ?? DefaultAccountId;
-    var acct = $"acct={accountId}";
-    Log("info", $"observed @ {observe.TimestampUtc}  {acct}  {cc}  {cx}");
+    // top-level `LegacyDefaultAccountId` sentinel so we never drop data.
+    var accountId = observe.AccountId ?? PersistencePaths.LegacyDefaultAccountId;
+    Log("info", $"observed @ {observe.TimestampUtc}  acct={accountId}  {cc}  {cx}");
 
     if (observe.ClaudeCode is null) return;
+
+    // Phase 7b: if the pre-Phase-7b flat history.jsonl is still on disk,
+    // migrate it now under THIS observe's account_id, then immediately
+    // seed the in-memory window and emit backfill for the migrated rows.
+    // First-observe timing means the user sees a populated chart within
+    // a second or two of widget launch, not the multi-second gap we'd
+    // see if migration ran at startup tagged as acct_default.
+    if (legacyMigrator.MigrationNeeded())
+    {
+        var migratedRows = legacyMigrator.MigrateIfNeeded(accountId);
+        if (migratedRows.Count > 0)
+        {
+            if (!snapshotsByAccount.TryGetValue(accountId, out var seedWindow))
+            {
+                seedWindow = new ObservationWindow();
+                snapshotsByAccount[accountId] = seedWindow;
+            }
+            seedWindow.Seed(migratedRows, capturedAt);
+            EmitBackfill(seedWindow.Snapshots, accountId);
+        }
+    }
 
     if (!snapshotsByAccount.TryGetValue(accountId, out var snapshots))
     {
@@ -238,6 +246,11 @@ static void HandleObserve(
         // frozen rate would smear onto B's projection).
         tier = new Tier1WeightedBurnRate(predictorOptions, monteCarlo, hawkesScaler);
         tiersByAccount[accountId] = tier;
+    }
+    if (!writersByAccount.TryGetValue(accountId, out var writer))
+    {
+        writer = new HistoryJsonlWriter(accountId);
+        writersByAccount[accountId] = writer;
     }
 
     DateTimeOffset? refreshAt = null;
@@ -267,6 +280,33 @@ static void HandleObserve(
     var activity = detector.Detect(telemetrySnapshot, capturedAt);
     var result = tier.Compute(snapshots.Snapshots, activity, telemetrySnapshot, capturedAt);
     EmitPrediction(result, accountId);
+}
+
+static void EmitBackfill(IEnumerable<UsageSnapshot> snapshots, string accountId)
+{
+    // Replay loaded/migrated snapshots to the host as tier=0 ("backfill")
+    // prediction messages so the popup's history line is populated
+    // immediately. The host's prediction_store sees tier=0 and pushes only
+    // to history, leaving `latest` untouched for the live prediction that
+    // arrives on the next observe.
+    foreach (var s in snapshots)
+    {
+        if (!s.UsedPercent.HasValue) continue;
+        var backfill = new PredictionMessage
+        {
+            TimestampUtc = FormatUtc(s.CapturedAtUtc),
+            Tier = 0,
+            Risk = "unknown",
+            Stale = false,
+            UsedPercent = s.UsedPercent,
+            RefreshAtUtc = s.RefreshAtUtc is { } r ? FormatUtc(r) : null,
+            ProbabilityEmptyBeforeRefresh = 0.0,
+            AccountId = accountId,
+        };
+        var backfillLine = JsonSerializer.Serialize(backfill, IpcJsonContext.Default.PredictionMessage);
+        Console.Out.WriteLine(backfillLine);
+    }
+    Console.Out.Flush();
 }
 
 static void EmitPrediction(PredictionResult r, string accountId)
@@ -302,6 +342,15 @@ static void EmitPrediction(PredictionResult r, string accountId)
     var line = JsonSerializer.Serialize(message, IpcJsonContext.Default.PredictionMessage);
     Console.Out.WriteLine(line);
     Console.Out.Flush();
+}
+
+static void DisposeAllWriters(Dictionary<string, HistoryJsonlWriter> writers)
+{
+    foreach (var w in writers.Values)
+    {
+        try { w.Dispose(); } catch { /* best-effort cleanup on shutdown */ }
+    }
+    writers.Clear();
 }
 
 static string FormatUtc(DateTimeOffset t) => t.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ");

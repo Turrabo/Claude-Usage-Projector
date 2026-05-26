@@ -15,7 +15,29 @@ public static class PersistencePaths
     /// <summary>%APPDATA%\Claude-Code-Usage-Monitor\predictor\</summary>
     public static string Root { get; } = ComputeRoot();
 
-    public static string HistoryJsonl => Path.Combine(Root, "history.jsonl");
+    /// <summary>
+    /// Sentinel account id used both on disk and on the wire when the active
+    /// account can't be determined (credentials.json missing/unreadable, or
+    /// a v:1 host paired with a v:2 predictor). Mirrors the
+    /// <c>DEFAULT_ACCOUNT_ID</c> constant on the Rust host side.
+    /// </summary>
+    public const string LegacyDefaultAccountId = "acct_default";
+
+    /// <summary>
+    /// Pre-Phase-7b flat history file. Migrated to a per-account shard by
+    /// <see cref="LegacyHistoryMigrator"/> on first observe; once migration
+    /// runs this file no longer exists (the backup is at
+    /// <see cref="LegacyHistoryJsonlBackup"/>).
+    /// </summary>
+    public static string LegacyHistoryJsonl => Path.Combine(Root, "history.jsonl");
+
+    /// <summary>
+    /// Where the legacy <c>history.jsonl</c> is renamed to after migration.
+    /// Existence of this file doubles as the migration-already-ran sentinel.
+    /// </summary>
+    public static string LegacyHistoryJsonlBackup =>
+        Path.Combine(Root, "history.jsonl.pre-multi-auth-backup");
+
     public static string MigrationSentinel => Path.Combine(Root, ".csm-migrated");
     public static string CsmSqlite => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),

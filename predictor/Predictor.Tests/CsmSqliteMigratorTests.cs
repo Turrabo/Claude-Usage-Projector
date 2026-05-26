@@ -27,12 +27,11 @@ public sealed class CsmSqliteMigratorTests : IDisposable
     {
         var sentinel = Path.Combine(_root, ".csm-migrated");
         File.WriteAllText(sentinel, "prior run");
-        var writer = new HistoryJsonlWriter(Path.Combine(_root, "history.jsonl"));
         var migrator = new CsmSqliteMigrator(
-            writer,
             log: null,
             sqlitePathOverride: Path.Combine(_root, "absent.sqlite"),
-            sentinelPathOverride: sentinel);
+            sentinelPathOverride: sentinel,
+            outputPathOverride: Path.Combine(_root, "history.jsonl"));
 
         migrator.MigrateIfNeeded().Should().BeNull();
     }
@@ -41,41 +40,45 @@ public sealed class CsmSqliteMigratorTests : IDisposable
     public void Migrator_SkippedWhenSqliteAbsent_WritesSentinel()
     {
         var sentinel = Path.Combine(_root, ".csm-migrated");
-        var writer = new HistoryJsonlWriter(Path.Combine(_root, "history.jsonl"));
         var migrator = new CsmSqliteMigrator(
-            writer,
             log: null,
             sqlitePathOverride: Path.Combine(_root, "absent.sqlite"),
-            sentinelPathOverride: sentinel);
+            sentinelPathOverride: sentinel,
+            outputPathOverride: Path.Combine(_root, "history.jsonl"));
 
         migrator.MigrateIfNeeded().Should().BeNull();
         File.Exists(sentinel).Should().BeTrue();
     }
 
     [Fact]
-    public void Migrator_CopiesTruthSourceRowsWithinWindow()
+    public void Migrator_CopiesTruthSourceRowsWithinWindow_IntoLegacyPath()
     {
         var sqlitePath = Path.Combine(_root, "csm.sqlite");
         SeedSqlite(sqlitePath);
 
         var historyPath = Path.Combine(_root, "history.jsonl");
-        var writer = new HistoryJsonlWriter(historyPath);
         var migrator = new CsmSqliteMigrator(
-            writer,
             log: null,
             sqlitePathOverride: sqlitePath,
-            sentinelPathOverride: Path.Combine(_root, ".csm-migrated"));
+            sentinelPathOverride: Path.Combine(_root, ".csm-migrated"),
+            outputPathOverride: historyPath);
 
         var n = migrator.MigrateIfNeeded();
 
         n.Should().BeGreaterThan(0);
-        writer.Dispose();
+        File.Exists(historyPath).Should().BeTrue("CSM migration writes the legacy un-sharded file; Phase 7b migrator re-shards on first observe");
 
-        var reader = new HistoryJsonlReader(_root);
-        var loaded = reader.LoadAll(out var skipped);
-        skipped.Should().Be(0);
-        loaded.Should().NotBeEmpty();
-        loaded.Should().OnlyContain(s => s.UsedPercent.HasValue);
+        // The migrator writes v:1 rows (no account_id). Reader's
+        // LoadAllByAccount intentionally ignores the legacy file — that's
+        // LegacyHistoryMigrator's responsibility. Confirm the file contents
+        // are well-formed JSONL though.
+        var lines = File.ReadAllLines(historyPath);
+        lines.Should().HaveCount(n!.Value);
+        foreach (var l in lines)
+        {
+            l.Should().StartWith("{");
+            l.Should().Contain("\"used_pct\":");
+        }
     }
 
     private static void SeedSqlite(string path)

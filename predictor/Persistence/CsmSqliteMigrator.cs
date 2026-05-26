@@ -1,6 +1,7 @@
 using System;
 using System.Globalization;
 using System.IO;
+using System.Text;
 using Microsoft.Data.Sqlite;
 
 namespace ClaudeUsageProjector.Predictor.Persistence;
@@ -8,8 +9,15 @@ namespace ClaudeUsageProjector.Predictor.Persistence;
 /// <summary>
 /// One-time-at-first-run migration: reads truth-source UsageSnapshot rows
 /// from the predecessor Claude Session Monitor's SQLite database and appends
-/// them to the predictor's history.jsonl. Records a sentinel file so we
-/// don't migrate twice.
+/// them to the predictor's <em>legacy</em> <c>history.jsonl</c> file.
+/// Records a sentinel file so we don't migrate twice.
+/// <para/>
+/// Why the legacy un-sharded path: this migration predates Phase 7b's
+/// per-account sharding. The Phase 7b migrator (<see cref="LegacyHistoryMigrator"/>)
+/// picks up <c>history.jsonl</c> on the first observe and re-shards its rows
+/// under the active <c>account_id</c>, so CSM-imported truth-source rows
+/// land in the right account-keyed shard the same way the user's prior
+/// observations do.
 /// <para/>
 /// Microsoft.Data.Sqlite is the only place in the predictor that touches a
 /// native dependency (e_sqlite3.dll). Self-contained single-file publish
@@ -21,19 +29,19 @@ public sealed class CsmSqliteMigrator
 
     private readonly string _sqlitePath;
     private readonly string _sentinelPath;
-    private readonly HistoryJsonlWriter _writer;
+    private readonly string _outputPath;
     private readonly Action<string, string>? _log;
 
     public CsmSqliteMigrator(
-        HistoryJsonlWriter writer,
         Action<string, string>? log = null,
         string? sqlitePathOverride = null,
-        string? sentinelPathOverride = null)
+        string? sentinelPathOverride = null,
+        string? outputPathOverride = null)
     {
-        _writer = writer;
         _log = log;
         _sqlitePath = sqlitePathOverride ?? PersistencePaths.CsmSqlite;
         _sentinelPath = sentinelPathOverride ?? PersistencePaths.MigrationSentinel;
+        _outputPath = outputPathOverride ?? PersistencePaths.LegacyHistoryJsonl;
     }
 
     /// <summary>
@@ -98,6 +106,10 @@ public sealed class CsmSqliteMigrator
             "ORDER BY CapturedAtUtc ASC";
         cmd.Parameters.AddWithValue("$cutoff", cutoff);
 
+        var dir = System.IO.Path.GetDirectoryName(_outputPath);
+        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+        using var fs = new FileStream(_outputPath, FileMode.Append, FileAccess.Write, FileShare.Read);
+
         int rows = 0;
         using var reader = cmd.ExecuteReader();
         while (reader.Read())
@@ -107,15 +119,19 @@ public sealed class CsmSqliteMigrator
             var refreshAt = reader.IsDBNull(2) ? null : reader.GetString(2);
             if (usedPct is null) continue;
 
-            // Write directly via AppendRaw so we don't round-trip through
-            // UsageSnapshot's stricter type system; the JSON shape is fixed.
+            // Write v:1 rows (no account_id) — the Phase 7b migrator picks
+            // these up on first observe and re-shards them under the active
+            // account_id. JSON shape is fixed and small; serialise inline
+            // rather than round-trip through PersistedSnapshot.
             var line = "{\"v\":1,\"t\":\"" + captured + "\",\"used_pct\":" +
                        usedPct.Value.ToString("R", CultureInfo.InvariantCulture) +
                        (refreshAt is null ? "" : ",\"refresh_at\":\"" + refreshAt + "\"") +
-                       "}";
-            _writer.AppendRaw(line);
+                       "}\n";
+            var bytes = Encoding.UTF8.GetBytes(line);
+            fs.Write(bytes, 0, bytes.Length);
             rows++;
         }
+        fs.Flush();
         return rows;
     }
 
