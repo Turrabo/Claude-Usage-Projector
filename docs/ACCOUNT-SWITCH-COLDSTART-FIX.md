@@ -21,7 +21,7 @@ The chart's X axis should never imply more history than the per-account store ac
 
 ## Sub-tasks
 
-### A — narrow the chart window when account history is sparse (shipping in commit `<TBD>`)
+### A — narrow the chart window when account history is sparse (shipped, commit `47b9dc2`)
 
 - **File:** [`src/csm/popup.rs`](../src/csm/popup.rs)
 - **Change:** extracted a pure helper `compute_session_window(refresh_unix, earliest_truth_unix, now_unix) -> Option<(i64, i64, bool)>` at the bottom of `popup.rs` with a `#[cfg(test)] mod tests` block covering all four input branches. The chart-rendering function calls the helper and emits the "no snapshots yet" hint when the helper returns `None`. When `refresh_unix` is `Some(end)` AND there's at least one history entry, `session_start = max(end - 5*3600, earliest_truth_unix)`.
