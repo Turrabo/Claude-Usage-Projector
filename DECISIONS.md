@@ -97,7 +97,7 @@ Store observations and Claude Code events as append-only JSONL files; store Hawk
 ## ADR-005: GNU/gnullvm + LLVM-MinGW for local Rust builds; CI MSVC for runnable binaries
 
 **Date:** 2026-05-13
-**Status:** Accepted — partially superseded by ADR-010 for runnable local binaries; gnullvm path retained as compile-check fallback.
+**Status:** Accepted 2026-05-13 — superseded 2026-05-26 by ADR-013 (native MSVC is now the canonical local path; gnullvm machinery retired). Original libunwind static-link recipe from the retired `tools/dev-build.ps1` is preserved in Appendix A below.
 
 ### Context
 
@@ -117,6 +117,20 @@ Empirically, `gnullvm` + `winget install MartinStorsjo.LLVM-MinGW.UCRT` produces
 - The C# predictor is unaffected — local `dotnet publish` produces a fully runnable predictor exe.
 - If MSVC Build Tools ever become installable on this machine (e.g., IT policy change), this ADR is superseded: run `rustup override unset` in the repo directory to drop back to the default `stable-x86_64-pc-windows-msvc` toolchain, remove `tools/dev-build.ps1`, and delete or empty `.cargo/config.toml` (currently only holds the `WINRES_TOOLCHAIN` env var for the LLVM-MinGW path). Net delta is small.
 - New contributors on machines with MSVC available **should not** use the gnullvm path — `cargo build --release` will just work via the default msvc toolchain.
+
+### Appendix A (added 2026-05-26): libunwind static-link recipe from the retired `tools/dev-build.ps1`
+
+When this ADR was active, building via gnullvm + LLVM-MinGW left the resulting `.exe` with a runtime dependency on `libunwind.dll` because LLVM-MinGW dynamically links libunwind by default. The Rust gnullvm target spec appends `-lunwind` after our `link-args`, and the linker picks the dynamic import library (`libunwind.dll.a`) ahead of the static one (`libunwind.a`) — no clean cargo or RUSTFLAGS override is available. The retired `tools/dev-build.ps1` worked around this with a rename trick:
+
+1. Locate `<llvm-mingw>/x86_64-w64-mingw32/lib/libunwind.dll.a` (the dynamic import library).
+2. Rename it to `libunwind.dll.a.devbuild-bak` so the linker only finds `libunwind.a` and falls back to static linking.
+3. Set `WINRES_TOOLCHAIN` to the LLVM-MinGW root so the `winres` build-dep can find `windres`.
+4. `cargo build --release`.
+5. Restore `libunwind.dll.a` from backup in a `try/finally` so an interrupted build doesn't leave the toolchain broken. The recovery path also restored the import lib at startup when a previous run had died mid-build (Ctrl-C, BSOD, AV kill) and left the toolchain with the backup in place but no original file.
+
+Result: a single self-contained `claude-code-usage-monitor.exe` whose only DLL imports are Windows system libraries — at compile time. (The runtime silent-exit bug at the `tray event hook installed` log line — the original reason this ADR was downgraded — was never resolved; if a future contributor needs gnullvm again, that bug remains an open obstacle.)
+
+Captured here per the global doc-hygiene rule "extract lessons before deletion." Native MSVC (ADR-013) is the recommended path.
 
 ---
 
@@ -221,7 +235,7 @@ The hover trigger for the existing Phase 4 popup moved from the upstream widget 
 ## ADR-010: cargo-xwin for runnable local builds on the MSVC-blocked machine
 
 **Date:** 2026-05-21
-**Status:** Accepted — partial supersession of ADR-005 for runnable binaries; ADR-005's gnullvm path remains as the compile-check-only fallback.
+**Status:** Accepted 2026-05-21 — superseded 2026-05-26 by ADR-013. The body's "produces a runnable binary in ~10s" claim was incorrect: cargo-xwin binaries crashed at runtime on the maintainer's machine with the same USER32 0x35532 access violation as native MSVC builds (the bug is in the source/build, not the toolchain — diagnosed 2026-05-22). The cross-compile path was retired without ever delivering a confirmed working runtime on this machine. ADR-013 records the lesson: smoke-test the produced binary before declaring a build path "runnable."
 
 ### Context
 
@@ -328,3 +342,37 @@ Concretely:
 - **No conflict resolution needed.** The composite primary key `(account_id, machine_id, ts)` means concurrent writes from different machines can't collide; idempotent `INSERT OR IGNORE` handles retry storms. Observations are immutable once written; no UPDATE path is needed.
 - **`JsonlTail` data stays machine-local.** The Hawkes-feeding session-timing data from `~/.claude/projects/**/*.jsonl` is more sensitive than the OAuth-derived percentages (it timestamps when you ran what session). It is intentionally NOT synced — each machine's Hawkes model uses local data only. Tier 1/2 (the chart-driving tiers) are the synced bits.
 - **Cost.** Expected steady-state: ~2 requests/minute/machine × 2 machines = ~5800 requests/day, well within the Workers Free 100 k/day. D1 footprint is ~tens of KB/day; the 1 GB free quota is years away.
+
+---
+
+## ADR-013: Native MSVC is the canonical local build path; cargo-xwin and gnullvm retired
+
+**Date:** 2026-05-26
+**Status:** Accepted — supersedes ADR-005 (gnullvm) and ADR-010 (cargo-xwin) for steady-state local development.
+
+### Context
+
+ADR-005 (gnullvm + LLVM-MinGW, compile-check only) and ADR-010 (cargo-xwin + LLD, claimed runnable) were both workarounds premised on "the developer's machine cannot install MSVC C++ Build Tools" — an IT block first asserted in ADR-003 and propagated through the toolchain ADRs. A diagnostic session on 2026-05-22 disproved that premise:
+
+- The 13 May 2026 install attempts that "failed silently" actually completed successfully. The master setup log shows `Completed install`, the VCTools workload requested and accepted, ~8 GB consumed. The reason no MSVC files appeared on disk after each attempt is that PowerShell's `Start-Process -Verb RunAs -ArgumentList @(...)` does **not** quote array elements before passing them to the elevated child process. The `--installPath "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"` argument arrived at `setup.exe` as five separate tokens; `setup.exe` accepted the first one and used `C:\Program` as the `installPath`. Each attempt installed cleanly into `C:\Program\`, which was subsequently deleted (manually or by tidy-up) as a stray top-level directory. The corporate IT block existed only in our heads.
+- On 2026-05-22, a re-attempt with `--installPath C:\BuildTools` (no spaces, sidestepping the bug) installed cleanly. VS Build Tools 2022 17.14.x with the VCTools workload now lives at `C:\BuildTools\`. `cl.exe`, `link.exe`, and the Windows SDK headers are all present and reachable via `C:\BuildTools\VC\Auxiliary\Build\vcvars64.bat`.
+- Native `cargo build --release` against the default `stable-x86_64-pc-windows-msvc` toolchain takes ~27 seconds, embeds the icon + version metadata via `winres` + the Windows SDK's `rc.exe`, and produces a 1 MB binary. No SKIP_WINRES escape hatch needed, no LLD shim, no cargo-xwin.
+- A separate runtime bug — the locally-built binary still crashes USER32 0x35532 within ~2 seconds on this specific machine, while CI-built binaries of byte-identical source run cleanly — is unrelated to toolchain. cargo-xwin builds crashed identically, which is what motivates the supersession: neither workaround actually delivered a confirmed working binary on this machine. The crash is captured in the auto-memory at `project_local_build_user32_crash.md` and tracked separately via the planned `dumpbin /HEADERS` and `/LOADCONFIG` diff between the CI artifact and a local build.
+
+### Decision
+
+- **Canonical local build path:** `cargo build --release` against the default `stable-x86_64-pc-windows-msvc` toolchain. Source `C:\BuildTools\VC\Auxiliary\Build\vcvars64.bat` once per shell (or use the "Developer PowerShell for VS 2022" shortcut) so `cl.exe`, `link.exe`, and `rc.exe` are on `PATH` + `INCLUDE` + `LIB`. No wrapper script.
+- **CI builds:** `.github/workflows/build-host.yml` continues using the default msvc toolchain on `windows-latest`. The `branches-ignore: main` trigger (which masked the USER32 regression for several days in May 2026) was removed in commit `5a08d0a` so post-merge regressions are visible.
+- **Runnable on this maintainer's machine:** **still requires the CI artifact, pending USER32 crash resolution.** Locally-built binaries compile cleanly but don't run on this specific Windows 11 install — the same bug affected both cargo-xwin and native MSVC, so it's not in the build path. Investigation deferred (PE-header diff between CI exe and local exe; see `project_local_build_user32_crash.md`).
+- **`tools/dev-build.ps1` (gnullvm) and `tools/dev-build-msvc.ps1` (cargo-xwin):** deleted. ADR-005's body is retained for history, with the libunwind static-link recipe lifted into Appendix A. ADR-010's body is retained for history with a corrective Status line.
+- **`.cargo/config.toml`:** retained as an intentional empty placeholder for any future fork-specific cargo config; comment updated to drop references to the retired scripts.
+
+### Consequences
+
+- One canonical local build path instead of three (gnullvm compile-only, cargo-xwin "runnable", CI runnable). New contributors set up a single Rust toolchain + standard MSVC and `cargo build --release` works.
+- Disk reclaim: 5.38 GB cargo-xwin SDK cache (`%LOCALAPPDATA%\cargo-xwin\`), 5 MB `lld-link.exe` shim in `~/.cargo/bin`, ~20 MB cargo subcommands (`cargo uninstall xwin cargo-xwin`), and the `stable-x86_64-pc-windows-gnullvm` + `stable-x86_64-pc-windows-gnu` Rust toolchains (~750 MB each) all become reclaimable. None are deleted by this ADR — see follow-up commits.
+- **Lesson 1 (PowerShell elevation quoting):** `Start-Process -Verb RunAs -ArgumentList @('--installPath', 'C:\Path With Spaces')` silently splits the spaced path. For installers, future fork tooling, or any other use that passes paths with spaces through UAC elevation: build a single quoted command string and pass it as a single ArgumentList element, OR use an installPath without spaces. The cost of getting this wrong: silent install to the wrong location, no error messages, and (in our case) ~6 weeks of misdirected blame on corporate IT.
+- **Lesson 2 (smoke-test before declaring "runnable"):** ADR-010's "runs identically to a CI-built one" claim stuck in the docs for ~24 hours without any contributor actually launching the produced binary. The diagnose log was never tailed, the badge never appeared on screen, and the documented confidence was unearned. For any future ADR that introduces a new build path: at minimum, launch the produced binary, verify the diagnose log records `window shown` and the first poll completes, before merging the ADR or any cross-references to it.
+- The "MSVC blocked by IT" framing in ADR-003, ADR-005, and ADR-010 was a false premise from Lesson 1. Per the append-only ADR discipline (CLAUDE.md global rule 4 — "retired entities only appear in retirement context"), those ADRs keep their original bodies and get supersession Status lines; this ADR documents the disproof.
+- The USER32 crash investigation becomes the next critical-path item for restoring local-runnable iteration. It does not block Phase 7b/7c/7d/7e work, but it should be resolved before Phase 7e (Worker sync integration), where local smoke-test cycles speed up iteration meaningfully.
+- Future updates to VS Build Tools may re-trigger McAfee's `ElevationServiceSupport: Blocked` policy. The no-spaces `C:\BuildTools` install path captured in this ADR is the durable workaround; document machine rebuild requirements alongside it.
