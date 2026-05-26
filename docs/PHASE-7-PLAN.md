@@ -58,12 +58,19 @@ Originally scoped as one sub-milestone; split during implementation into three c
 
 ### 7c — UI: popover per-account table
 
-- `src/csm/popup.rs` gains a top section (above the existing chart) — a fixed-height table showing each known account's name, current risk colour pill, projected runout time, and a small marker for "(this machine)" vs "(other machine)" based on which machine produced the row's most recent observation.
-- Account display name comes from a per-account-id alias map in the predictor's config (`sync.env` or a sibling), defaulting to `account_id` short-form if no alias set. Maintainer can label each `acct_xxxxxxxxxxxx` as "Work A" / "Work B" / "Personal".
-- Badge in `src/csm/badge.rs` continues to show only the active account's risk + runout — no UI change there.
-- Acceptance: with 3 accounts populated in the local predictor state (forced via test fixtures if needed), the popover shows a clean 3-row table; the badge shows just the active account.
+**7c (shipped, commits `e70e3a3` + `6c9adb6`)** — per-account table above the chart.
 
-Estimated effort: 2–3 days. Independent of 7d/7e; depends on 7a.
+- `src/csm/popup.rs` POPUP_HEIGHT grew 160 → 260 to fit a new 104-px table strip above the existing chart. Each row carries an active-account marker (small filled risk-coloured square on the left), the display name, a coloured pill with the current used%, and the projected runout time (HH:MMam/pm if it lands before the session refresh; otherwise "—"). The active account is pinned at row 0; remaining accounts follow in alphabetical order. Cap is `MAX_TABLE_ROWS = 4`; when more accounts exist, the last row becomes a "+N more" footer so the count remains discoverable without the strip overflowing into the chart.
+- New `src/csm/aliases.rs`: per-account display-name resolver. Reads `%APPDATA%\Claude-Code-Usage-Monitor\account-aliases.json` (host-side cross-cutting root, *not* the predictor's `predictor\` subfolder, and *not* `sync.env` — that's a separate file for Worker credentials). Map shape is `{"acct_<12hex>": "<friendly name>"}`. Missing/empty/unparseable → fall back to a short form like `acct_abc123de…`. mtime-cached so paint ticks are cheap. Char-boundary-safe truncation so a hand-edited file with non-ASCII keys doesn't panic the paint path.
+- `src/csm/prediction_store.rs` gains a public `accounts()` enumerator (stable alphabetical order so the table doesn't flicker between paint ticks) and promotes `snapshot_for_account` to `pub` so the popup can pull per-row latest predictions without going through the active-account resolution.
+- `acct_default` (the IPC fallback bucket) is suppressed from the visible list whenever at least one real account is present, so it doesn't read as a phantom row.
+- Long aliases get `DT_END_ELLIPSIS` clipping rather than mid-glyph chops.
+- Badge in `src/csm/badge.rs` continues to show only the active account's risk + runout — no UI change there, per plan.
+- 9 unit tests added across `aliases` (5 — including non-ASCII robustness) and `prediction_store::accounts` (3) plus other follow-ups. 28/28 Rust tests passing.
+
+**Deferred to 7e** (intentional per the plan): the "(this machine)" / "(other machine)" tag. Pre-sync every observation is local, so the tag would always read "(this machine)" — uninformative until cross-machine rows start arriving via the Worker. 7e adds it when it adds the sync layer.
+
+**Acceptance** (now testable): with 3 accounts populated in `prediction_store`, the popover shows a clean 3-row table with the active account pinned at top + dim inactive rows below; the badge is unchanged.
 
 ### 7d — Cloudflare Worker deployment
 
