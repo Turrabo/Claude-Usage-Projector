@@ -358,8 +358,24 @@ unsafe fn paint(hdc: HDC) {
 }
 
 unsafe fn paint_accounts_table(hdc: HDC) {
-    let accounts = store().accounts();
+    let raw_accounts = store().accounts();
     let active = current_account_id().unwrap_or_else(|| DEFAULT_ACCOUNT_ID.to_string());
+
+    // `acct_default` is the IPC fallback bucket — predictor uses it when an
+    // observe arrives without an account_id (v:1 host, or unreadable
+    // credentials). Showing it as a "real" account row alongside actual
+    // accounts reads as a phantom row. Suppress it when at least one real
+    // account is known; keep it as the only row in the cold-start case
+    // where it's the sole bucket the predictor has seen.
+    let has_real_account = raw_accounts.iter().any(|a| a != DEFAULT_ACCOUNT_ID);
+    let accounts: Vec<String> = if has_real_account {
+        raw_accounts
+            .into_iter()
+            .filter(|a| a != DEFAULT_ACCOUNT_ID)
+            .collect()
+    } else {
+        raw_accounts
+    };
 
     if accounts.is_empty() {
         // No predictions yet — show a single hint line where the first row
@@ -389,23 +405,29 @@ unsafe fn paint_accounts_table(hdc: HDC) {
             ordered.push(a.clone());
         }
     }
-    let visible: Vec<&String> = ordered.iter().take(MAX_TABLE_ROWS).collect();
+
+    // When the visible list overflows, surrender the last row's slot to a
+    // "+N more" footer so the count remains discoverable. This keeps the
+    // footer fully within the table strip (above the divider at
+    // TABLE_AREA_HEIGHT - 4) — drawing it below the row stack would push
+    // into the chart area.
+    let need_footer = ordered.len() > MAX_TABLE_ROWS;
+    let visible_count = if need_footer { MAX_TABLE_ROWS - 1 } else { ordered.len() };
+    let visible: &[String] = &ordered[..visible_count];
 
     for (i, account_id) in visible.iter().enumerate() {
         let row_y = TABLE_TOP_PAD + (i as i32) * TABLE_ROW_HEIGHT;
-        paint_table_row(hdc, account_id, account_id == &&active, row_y);
+        paint_table_row(hdc, account_id, account_id == &active, row_y);
     }
 
-    if accounts.len() > MAX_TABLE_ROWS {
-        // Tail indicator — keeps the user aware that some accounts aren't
-        // shown. Lives in the bottom inch of the table strip in dim text.
-        let footer_y = TABLE_TOP_PAD + (visible.len() as i32) * TABLE_ROW_HEIGHT - 4;
+    if need_footer {
+        let footer_y = TABLE_TOP_PAD + (MAX_TABLE_ROWS as i32 - 1) * TABLE_ROW_HEIGHT;
         draw_text_left(
             hdc,
-            &format!("+{} more", accounts.len() - visible.len()),
+            &format!("+{} more", ordered.len() - visible_count),
             POPUP_WIDTH - TABLE_RIGHT_PAD,
-            TABLE_LEFT_PAD + ACTIVE_MARKER_WIDTH,
-            footer_y,
+            TABLE_LEFT_PAD + ACTIVE_MARKER_WIDTH + 2,
+            footer_y + 4,
             COLOR_HINT,
         );
     }
@@ -434,13 +456,14 @@ unsafe fn paint_table_row(hdc: HDC, account_id: &str, is_active: bool, y: i32) {
     }
 
     // Display name. Active row gets brighter text; inactive rows are dim
-    // (matching CSM's "current vs other" hierarchy).
+    // (matching CSM's "current vs other" hierarchy). Long aliases get
+    // ellipsis-clipped by DrawTextW rather than mid-character cut-off.
     let name_color = if is_active { COLOR_TEXT_BRIGHT } else { COLOR_DIM };
     let name = aliases::display_name(account_id);
     let name_left = TABLE_LEFT_PAD + ACTIVE_MARKER_WIDTH + 2;
     let pill_right = POPUP_WIDTH - TABLE_RIGHT_PAD - RUNOUT_TEXT_WIDTH;
     let pill_left = pill_right - PILL_WIDTH;
-    draw_text_left(hdc, &name, pill_left - 4, name_left, y + 4, name_color);
+    draw_text_clipped(hdc, &name, name_left, y + 4, pill_left - 4, name_color);
 
     // Pill: a filled rounded-rect coloured by risk, with the used% text on
     // top. If we have no latest prediction the pill stays dim and shows
@@ -544,6 +567,33 @@ unsafe fn draw_text_centered(
         &mut buf,
         &mut rect,
         DT_CENTER | DT_SINGLELINE | DT_NOPREFIX,
+    );
+}
+
+/// Left-aligned `DrawTextW` with `DT_END_ELLIPSIS`, so long strings get
+/// trimmed to "Most of the n…" rather than mid-character clipped. Used by
+/// the per-account table for display names that may exceed the column.
+unsafe fn draw_text_clipped(
+    hdc: HDC,
+    text: &str,
+    left: i32,
+    y: i32,
+    right: i32,
+    color: COLORREF,
+) {
+    SetTextColor(hdc, color);
+    let mut buf: Vec<u16> = OsStr::new(text).encode_wide().collect();
+    let mut rect = RECT {
+        left,
+        top: y,
+        right,
+        bottom: y + 20,
+    };
+    DrawTextW(
+        hdc,
+        &mut buf,
+        &mut rect,
+        DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
     );
 }
 

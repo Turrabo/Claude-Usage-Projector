@@ -104,18 +104,29 @@ fn refresh_cache_if_stale() {
 
 /// Renders a long account id as a compact display token. `acct_abc123def456`
 /// becomes `acct_abc123de…`. Pre-`acct_` ids (sentinels or otherwise) are
-/// returned with the same horizon-length truncation.
+/// returned with the same horizon-length truncation. Char-boundary safe so
+/// a hypothetical non-ASCII account id doesn't panic the popup paint path.
 fn short_form(account_id: &str) -> String {
     if let Some(rest) = account_id.strip_prefix(ACCT_PREFIX) {
-        if rest.len() <= SHORT_FORM_HEX_LEN {
+        if rest.chars().count() <= SHORT_FORM_HEX_LEN {
             return account_id.to_string();
         }
-        return format!("{ACCT_PREFIX}{}…", &rest[..SHORT_FORM_HEX_LEN]);
+        return format!("{ACCT_PREFIX}{}…", char_truncate(rest, SHORT_FORM_HEX_LEN));
     }
-    if account_id.len() <= SHORT_FORM_HEX_LEN + ACCT_PREFIX.len() {
+    let total = SHORT_FORM_HEX_LEN + ACCT_PREFIX.len();
+    if account_id.chars().count() <= total {
         return account_id.to_string();
     }
-    format!("{}…", &account_id[..SHORT_FORM_HEX_LEN + ACCT_PREFIX.len()])
+    format!("{}…", char_truncate(account_id, total))
+}
+
+fn char_truncate(s: &str, n_chars: usize) -> &str {
+    // Find the byte index of the (n+1)th char start and slice up to it.
+    // Cheaper than allocating a new String for the common ASCII path.
+    match s.char_indices().nth(n_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
 }
 
 #[cfg(test)]
@@ -150,6 +161,15 @@ mod tests {
     #[test]
     fn display_name_empty_returns_question_mark() {
         assert_eq!(display_name(""), "?");
+    }
+
+    #[test]
+    fn short_form_does_not_panic_on_non_ascii_input() {
+        // Real account ids are ASCII hex; this defends against a hand-
+        // edited alias file or future protocol change shipping non-ASCII.
+        let id = "acct_émöjï123def🦀";
+        let s = short_form(id);
+        assert!(s.ends_with('…') || s == id);
     }
 
     #[test]
