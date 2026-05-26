@@ -15,6 +15,7 @@
 // trigger that opens the popup.
 
 pub mod account_id;
+pub mod aliases;
 pub mod badge;
 pub mod hover;
 pub mod ipc;

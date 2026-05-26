@@ -167,20 +167,20 @@ impl PredictionStore {
     /// predictor's own fallback so both sides agree on the bucket.
     /// Returns empty when that account hasn't received any predictions yet.
     ///
-    /// Phase 7a.4 plumbing only: callers (`badge.rs`, `popup.rs`) keep
-    /// seeing exactly one account. The internal `snapshot_for_account`
-    /// helper below is private today; Phase 7c will promote it to `pub`
-    /// (or add a sibling `accounts()` enumerator) to feed the multi-
-    /// account popover table.
+    /// `badge.rs` and the popover chart in `popup.rs` keep seeing the
+    /// active account only. The per-account popover table added in
+    /// Phase 7c uses `accounts()` + `snapshot_for_account` to enumerate
+    /// rows.
     pub fn snapshot(&self) -> (Option<LatestPrediction>, Vec<HistoryEntry>) {
         let active = current_account_id().unwrap_or_else(|| DEFAULT_ACCOUNT_ID.to_string());
         self.snapshot_for_account(&active)
     }
 
-    /// Same as `snapshot()` but for an explicit account id. Used by tests
-    /// today and earmarked for Phase 7c's multi-account popover table.
-    /// Returns `(None, vec![])` if the account hasn't been seen yet.
-    fn snapshot_for_account(
+    /// Same as `snapshot()` but for an explicit account id. Returns
+    /// `(None, vec![])` if the account hasn't been seen yet. Public from
+    /// Phase 7c so `popup.rs` can pull per-row latest predictions for the
+    /// per-account table.
+    pub fn snapshot_for_account(
         &self,
         account_id: &str,
     ) -> (Option<LatestPrediction>, Vec<HistoryEntry>) {
@@ -193,6 +193,23 @@ impl PredictionStore {
                 None => (None, Vec::new()),
             },
             Err(_) => (None, Vec::new()),
+        }
+    }
+
+    /// Stable-sorted list of account ids that have received at least one
+    /// prediction (live or backfill) in this process. Phase 7c uses this
+    /// to enumerate popover table rows. The sort order is alphabetical so
+    /// the row order is stable across paint ticks — important because the
+    /// popup repaints every few seconds and a churning row order would
+    /// read as flicker.
+    pub fn accounts(&self) -> Vec<String> {
+        match self.inner.lock() {
+            Ok(inner) => {
+                let mut ids: Vec<String> = inner.by_account.keys().cloned().collect();
+                ids.sort();
+                ids
+            }
+            Err(_) => Vec::new(),
         }
     }
 }
@@ -354,5 +371,34 @@ mod tests {
         let (_, b_hist) = store.snapshot_for_account("acct_BBBB");
         assert_eq!(a_hist.len(), HISTORY_LIMIT, "A capped at limit");
         assert_eq!(b_hist.len(), 3, "B's count unaffected by A's overflow");
+    }
+
+    #[test]
+    fn accounts_empty_on_fresh_store() {
+        let store = fresh_store();
+        assert!(store.accounts().is_empty());
+    }
+
+    #[test]
+    fn accounts_returns_all_seen_ids_sorted() {
+        let store = fresh_store();
+        store.push(&msg(Some("acct_ZZZZ"), 2, 1.0));
+        store.push(&msg(Some("acct_AAAA"), 2, 1.0));
+        store.push(&msg(Some("acct_MMMM"), 0, 1.0)); // backfill also counts
+        store.push(&msg(None, 2, 1.0));              // → acct_default
+
+        let accounts = store.accounts();
+        // Stable alphabetical order so the popover table doesn't flicker
+        // between paint ticks.
+        assert_eq!(accounts, vec!["acct_AAAA", "acct_MMMM", "acct_ZZZZ", DEFAULT_ACCOUNT_ID]);
+    }
+
+    #[test]
+    fn accounts_does_not_include_unpushed_ids() {
+        // Calling snapshot_for_account with an unknown id must not register it.
+        let store = fresh_store();
+        store.push(&msg(Some("acct_real"), 2, 1.0));
+        let _ = store.snapshot_for_account("acct_phantom");
+        assert_eq!(store.accounts(), vec!["acct_real"]);
     }
 }

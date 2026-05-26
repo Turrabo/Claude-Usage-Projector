@@ -28,11 +28,16 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::csm::account_id::{current_account_id, DEFAULT_ACCOUNT_ID};
+use crate::csm::aliases;
 use crate::csm::prediction_store::{store, HistoryEntry, LatestPrediction};
 use crate::diagnose;
 
 pub const POPUP_WIDTH: i32 = 450;
-pub const POPUP_HEIGHT: i32 = 160;
+// Phase 7c bumps the popup taller: the top TABLE_AREA_HEIGHT pixels show
+// the per-account table; the chart fills the rest. POPUP_HEIGHT was 160
+// pre-7c (chart-only).
+pub const POPUP_HEIGHT: i32 = 260;
 
 const POPUP_CLASS_NAME: &str = "ClaudeUsageProjectorPopup";
 
@@ -293,8 +298,24 @@ fn position_relative_to(anchor_x: i32, anchor_y: i32) -> (i32, i32) {
 const CORNER_RADIUS: i32 = 6;
 const PAD_L: i32 = 40;
 const PAD_R: i32 = 16;
+#[allow(dead_code)] // pre-Phase-7c constant superseded by TABLE_AREA_HEIGHT for the chart's top edge
 const PAD_T: i32 = 16;
 const PAD_B: i32 = 28;
+
+// Phase 7c — per-account table strip at the top of the popup.
+const TABLE_AREA_HEIGHT: i32 = 104; // total strip; chart starts at this Y
+const TABLE_ROW_HEIGHT: i32 = 22;
+const TABLE_TOP_PAD: i32 = 8;
+const TABLE_LEFT_PAD: i32 = 16;
+const TABLE_RIGHT_PAD: i32 = 16;
+const TABLE_DIVIDER_INSET: i32 = 14;
+const MAX_TABLE_ROWS: usize = 4;
+
+// Column geometry inside the table strip.
+const PILL_WIDTH: i32 = 64;
+const PILL_HEIGHT: i32 = 15;
+const RUNOUT_TEXT_WIDTH: i32 = 64;
+const ACTIVE_MARKER_WIDTH: i32 = 8;
 
 // COLORREF is 0x00BBGGRR. Define the CSM palette literally.
 const COLOR_BG: COLORREF = COLORREF(0x181818);
@@ -303,6 +324,7 @@ const COLOR_DIM: COLORREF = COLORREF(0x707070);
 const COLOR_NOW: COLORREF = COLORREF(0x555555);
 const COLOR_HISTORY: COLORREF = COLORREF(0xFF9F4C); // BGR for CSM #4C9FFF blue
 const COLOR_HINT: COLORREF = COLORREF(0x606060);
+const COLOR_TEXT_BRIGHT: COLORREF = COLORREF(0xC8C8C8); // for the active-account row name in the per-account table
 
 fn risk_color(risk: &str) -> COLORREF {
     // BGR encoding.
@@ -329,9 +351,200 @@ unsafe fn paint(hdc: HDC) {
     let font = GetStockObject(DEFAULT_GUI_FONT);
     let old_font = SelectObject(hdc, font);
 
+    paint_accounts_table(hdc);
     paint_chart(hdc, &latest, &history);
 
     SelectObject(hdc, old_font);
+}
+
+unsafe fn paint_accounts_table(hdc: HDC) {
+    let accounts = store().accounts();
+    let active = current_account_id().unwrap_or_else(|| DEFAULT_ACCOUNT_ID.to_string());
+
+    if accounts.is_empty() {
+        // No predictions yet — show a single hint line where the first row
+        // would have been, so the strip doesn't read as a dead band.
+        draw_text_left(
+            hdc,
+            "waiting for first observation…",
+            POPUP_WIDTH - TABLE_RIGHT_PAD,
+            TABLE_LEFT_PAD,
+            TABLE_TOP_PAD + 2,
+            COLOR_HINT,
+        );
+        draw_table_divider(hdc);
+        return;
+    }
+
+    // Pin the active account at the top, then any remaining accounts in
+    // the stable order `store().accounts()` returns (alphabetical). Cap at
+    // MAX_TABLE_ROWS — Adam's actual scenario is three accounts so the cap
+    // is comfortable.
+    let mut ordered: Vec<String> = Vec::with_capacity(accounts.len());
+    if accounts.contains(&active) {
+        ordered.push(active.clone());
+    }
+    for a in &accounts {
+        if a != &active {
+            ordered.push(a.clone());
+        }
+    }
+    let visible: Vec<&String> = ordered.iter().take(MAX_TABLE_ROWS).collect();
+
+    for (i, account_id) in visible.iter().enumerate() {
+        let row_y = TABLE_TOP_PAD + (i as i32) * TABLE_ROW_HEIGHT;
+        paint_table_row(hdc, account_id, account_id == &&active, row_y);
+    }
+
+    if accounts.len() > MAX_TABLE_ROWS {
+        // Tail indicator — keeps the user aware that some accounts aren't
+        // shown. Lives in the bottom inch of the table strip in dim text.
+        let footer_y = TABLE_TOP_PAD + (visible.len() as i32) * TABLE_ROW_HEIGHT - 4;
+        draw_text_left(
+            hdc,
+            &format!("+{} more", accounts.len() - visible.len()),
+            POPUP_WIDTH - TABLE_RIGHT_PAD,
+            TABLE_LEFT_PAD + ACTIVE_MARKER_WIDTH,
+            footer_y,
+            COLOR_HINT,
+        );
+    }
+
+    draw_table_divider(hdc);
+}
+
+unsafe fn paint_table_row(hdc: HDC, account_id: &str, is_active: bool, y: i32) {
+    let (latest, _hist) = store().snapshot_for_account(account_id);
+
+    // Left-margin active marker so the row order is glanceable. CSM-style:
+    // a small filled square in the risk colour for the active row, blank
+    // for inactive rows.
+    if is_active {
+        let active_color = latest
+            .as_ref()
+            .map(|p| risk_color(&p.risk))
+            .unwrap_or(COLOR_DIM);
+        let dot = RECT {
+            left: TABLE_LEFT_PAD,
+            top: y + 6,
+            right: TABLE_LEFT_PAD + ACTIVE_MARKER_WIDTH - 2,
+            bottom: y + 6 + ACTIVE_MARKER_WIDTH - 2,
+        };
+        fill_solid(hdc, &dot, active_color);
+    }
+
+    // Display name. Active row gets brighter text; inactive rows are dim
+    // (matching CSM's "current vs other" hierarchy).
+    let name_color = if is_active { COLOR_TEXT_BRIGHT } else { COLOR_DIM };
+    let name = aliases::display_name(account_id);
+    let name_left = TABLE_LEFT_PAD + ACTIVE_MARKER_WIDTH + 2;
+    let pill_right = POPUP_WIDTH - TABLE_RIGHT_PAD - RUNOUT_TEXT_WIDTH;
+    let pill_left = pill_right - PILL_WIDTH;
+    draw_text_left(hdc, &name, pill_left - 4, name_left, y + 4, name_color);
+
+    // Pill: a filled rounded-rect coloured by risk, with the used% text on
+    // top. If we have no latest prediction the pill stays dim and shows
+    // "—".
+    let pill_rect = RECT {
+        left: pill_left,
+        top: y + 3,
+        right: pill_right,
+        bottom: y + 3 + PILL_HEIGHT,
+    };
+    let pill_color = latest
+        .as_ref()
+        .map(|p| risk_color(&p.risk))
+        .unwrap_or(COLOR_GRID);
+    fill_solid(hdc, &pill_rect, pill_color);
+    let pill_label = match latest.as_ref().and_then(|p| p.used_pct) {
+        Some(pct) => format!("{:.0}%", pct),
+        None => "—".to_string(),
+    };
+    // Pill label colour: white on coloured pills; dim grey on the empty
+    // placeholder (so the row doesn't read as "high contrast nothing").
+    let pill_text_color = if latest.is_some() {
+        COLORREF(0xFFFFFF)
+    } else {
+        COLOR_HINT
+    };
+    draw_text_centered(
+        hdc,
+        &pill_label,
+        pill_left,
+        pill_right,
+        y + 4,
+        pill_text_color,
+    );
+
+    // Runout time: right-aligned next to the right padding. Showing the
+    // projected_p50 if known and inside the session; otherwise "—" so the
+    // row stays aligned.
+    let runout_label = latest
+        .as_ref()
+        .and_then(|p| {
+            let p50 = p.projected_p50_unix?;
+            let refresh = p.refresh_unix?;
+            if p50 < refresh {
+                Some(short_local_time(p50))
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "—".to_string());
+    let runout_color = if is_active && runout_label != "—" {
+        latest
+            .as_ref()
+            .map(|p| risk_color(&p.risk))
+            .unwrap_or(COLOR_DIM)
+    } else {
+        COLOR_DIM
+    };
+    draw_text_left(
+        hdc,
+        &runout_label,
+        POPUP_WIDTH - TABLE_RIGHT_PAD,
+        pill_right + 6,
+        y + 4,
+        runout_color,
+    );
+}
+
+unsafe fn draw_table_divider(hdc: HDC) {
+    let pen = CreatePen(PS_SOLID, 1, COLOR_GRID);
+    let old_pen = SelectObject(hdc, pen);
+    line(
+        hdc,
+        TABLE_DIVIDER_INSET,
+        TABLE_AREA_HEIGHT - 4,
+        POPUP_WIDTH - TABLE_DIVIDER_INSET,
+        TABLE_AREA_HEIGHT - 4,
+    );
+    SelectObject(hdc, old_pen);
+    let _ = DeleteObject(pen);
+}
+
+unsafe fn draw_text_centered(
+    hdc: HDC,
+    text: &str,
+    left: i32,
+    right: i32,
+    y: i32,
+    color: COLORREF,
+) {
+    SetTextColor(hdc, color);
+    let mut buf: Vec<u16> = OsStr::new(text).encode_wide().collect();
+    let mut rect = RECT {
+        left,
+        top: y,
+        right,
+        bottom: y + 20,
+    };
+    DrawTextW(
+        hdc,
+        &mut buf,
+        &mut rect,
+        DT_CENTER | DT_SINGLELINE | DT_NOPREFIX,
+    );
 }
 
 unsafe fn paint_chart(
@@ -341,7 +554,10 @@ unsafe fn paint_chart(
 ) {
     let plot_left = PAD_L;
     let plot_right = POPUP_WIDTH - PAD_R;
-    let plot_top = PAD_T;
+    // Chart starts immediately below the per-account table strip (Phase 7c).
+    // Pre-7c this was `PAD_T`; the constant is retained as historical
+    // padding-from-top semantic but is no longer the chart's top edge.
+    let plot_top = TABLE_AREA_HEIGHT;
     let plot_bottom = POPUP_HEIGHT - PAD_B;
     let plot_w = plot_right - plot_left;
     let plot_h = plot_bottom - plot_top;
