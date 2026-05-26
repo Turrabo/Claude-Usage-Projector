@@ -270,7 +270,7 @@ One-time admin setup populates the SDK cache: `xwin --accept-license splat --out
 ## ADR-011: Multi-auth — account identity model and per-account state
 
 **Date:** 2026-05-21
-**Status:** Accepted (design phase; implementation in Phase 7 — see [`docs/PHASE-7-PLAN.md`](docs/PHASE-7-PLAN.md))
+**Status:** Accepted (design phase 2026-05-21; implemented in Phase 7 — see [`docs/PHASE-7-PLAN.md`](docs/PHASE-7-PLAN.md)). The "Account identity" sub-decision (hash JWT.sub) was disproven on 2026-05-26 — see Appendix A below. The active derivation is `acct_<12 hex>` from SHA-256(organizationUuid); everything else in the original decision stands unchanged.
 
 ### Context
 
@@ -301,6 +301,36 @@ Option (C). The full design:
 - The Hawkes model becomes per-account, which means smaller per-account training data. For accounts used heavily this is fine; for low-volume accounts the predictor may sit on default parameters longer before fitting. We accept the tradeoff because pooling across accounts conflates very different usage rhythms.
 - Active-account detection ties us to Claude CLI's storage layout (`~/.claude/credentials.json`). If Anthropic restructures that file the detector breaks gracefully (predictor falls back to a single-account mode) — but we should keep an eye on Claude CLI releases.
 - Pairs with ADR-012 — the multi-auth and sync features are coupled architecturally even though they're separable in code.
+
+### Appendix A (added 2026-05-26): account identity derivation correction
+
+The original "Decision" bullet — *"Account identity is derived from the OAuth credential's `sub` claim (JWT subject)"* — was disproven on 2026-05-26 when the first-observe migration on the maintainer's machine tagged 1604 rows under `acct_default` instead of the real account. The host's `derive_from_jwt` returned None because Anthropic's `accessToken` isn't a JWT — it's an opaque `sk-ant-oat01-…` bearer token with a single dot-segment (the JWT splitter expects 3). The `refreshToken` follows the same opaque format. So the entire JWT premise was unfounded.
+
+Inspection of `.credentials.json` on a real install (structural keys only, no token bodies) showed the file's top-level keys are:
+
+```
+{ "claudeAiOauth": { accessToken, refreshToken, expiresAt, scopes, subscriptionType, rateLimitTier },
+  "organizationUuid": "<uuid>" }
+```
+
+`organizationUuid` is exactly the stable per-org identifier we need: distinct per Claude organisation, unchanged when tokens rotate, present in every credentials.json the maintainer's CLI version produces.
+
+**Revised derivation** (replaces the original "Decision" bullet on account identity):
+
+```
+account_id = "acct_" + first 12 hex chars of SHA-256(organizationUuid)
+```
+
+Everything else in ADR-011 stays correct as written. The IPC envelope shape, the sentinel fallback to `acct_default`, the per-account state design, the persistence sharding, and the popover table all work as designed once the host emits a real account_id.
+
+**Lessons:**
+
+- Don't pin a design on a token format we haven't actually inspected. We assumed JWT because OAuth-with-OIDC commonly uses one; Anthropic's choice was opaque bearer + a separate org-uuid field. A 5-minute look at the real credentials.json on day one of Phase 7 would have caught this.
+- Auto-classifier blocks on credential reads are correct by default. Adam giving explicit per-action read authorisation (with structural-only output, no token-body printing) is the right pattern for diagnostic work that needs to touch sensitive files.
+
+### Side note (still accurate from the original ADR)
+
+`JsonlTail` data, persistence migration, IPC version-handshake, and "auth is the host's job" all hold. None of those needed changing.
 
 ---
 

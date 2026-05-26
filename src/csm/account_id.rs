@@ -1,16 +1,20 @@
-// Derive a stable opaque account_id from the Claude OAuth access token.
+// Derive a stable opaque account_id from the user's local Claude
+// credentials file.
 //
-// See DECISIONS.md ADR-011 for the why. Briefly: every IPC observation
-// carries an account_id field so the predictor can key per-account state.
-// The id is derived from the JWT's `sub` claim hashed with SHA-256 and
-// truncated — short, stable across token refreshes (sub doesn't change),
-// and free of PII even in transit / on disk.
+// ADR-011 originally specified "hash the JWT subject claim of the access
+// token" — but on real Anthropic-issued credentials the access token is an
+// opaque `sk-ant-oat01-…` bearer, not a JWT. Hashing the token itself
+// would also rotate the account_id on every token refresh. The right
+// signal is the top-level `organizationUuid` field, which is stable per
+// Claude organization and doesn't change when the access/refresh tokens
+// rotate. See ADR-011 Appendix A for the disproof of the original JWT
+// assumption and the case for the current shape:
 //
-//   account_id = "acct_" + first 12 hex chars of SHA-256(jwt.sub)
+//   account_id = "acct_" + first 12 hex chars of SHA-256(organizationUuid)
 //
-// We don't validate the JWT signature. The credentials file is the local
-// source of truth; if it's been tampered with we have bigger problems
-// than account_id. We just need to parse the payload and extract `sub`.
+// 12 hex chars = 6 bytes of entropy. Plenty for the small number of
+// Claude orgs a single user touches before any practical collision risk;
+// short enough to be readable in a diagnose log line or a popup table.
 
 use std::sync::Mutex;
 use std::time::SystemTime;
@@ -23,9 +27,7 @@ use crate::diagnose;
 /// file missing/unreadable, pre-login state, or a v:1 host paired with a
 /// v:2 predictor). Matches the `DefaultAccountId` constant on the predictor
 /// side so observe-routing and prediction-store lookup agree on the same
-/// bucket. Phase 7b's persistence migration will retag pre-multi-auth rows
-/// out of this bucket; until then it's also where the predictor's
-/// startup-replayed backfill lands.
+/// bucket.
 pub const DEFAULT_ACCOUNT_ID: &str = "acct_default";
 
 /// Cache of the last-derived account_id and the credentials-file mtime
@@ -53,12 +55,15 @@ pub fn current_account_id() -> Option<String> {
             return cache.account_id.clone();
         }
         let content = std::fs::read_to_string(&path).ok()?;
-        let token = parse_access_token(&content)?;
-        let derived = derive_from_jwt(&token);
+        let derived = parse_organization_uuid(&content).map(|uuid| format_account_id(&uuid));
         cache.file_mtime = mtime;
         cache.account_id = derived.clone();
         if let Some(ref id) = derived {
             diagnose::log(format!("csm: active account = {id}"));
+        } else {
+            diagnose::log(
+                "csm: credentials.json present but no organizationUuid field — account_id unavailable",
+            );
         }
         derived
     } else {
@@ -66,26 +71,13 @@ pub fn current_account_id() -> Option<String> {
     }
 }
 
-/// Returns the canonical account_id for a given JWT access token, or
-/// `None` if the token doesn't decode to something with a `sub` claim.
-pub fn derive_from_jwt(jwt: &str) -> Option<String> {
-    let parts: Vec<&str> = jwt.split('.').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-    let payload_bytes = base64url_decode(parts[1])?;
-    let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
-    let sub = payload.get("sub")?.as_str()?;
-    Some(format_account_id(sub))
-}
-
-fn format_account_id(sub: &str) -> String {
+/// Canonical hex account id from any stable per-account string. Public
+/// only for tests and the predictor-side companion to agree on the format.
+pub fn format_account_id(stable_id: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(sub.as_bytes());
+    hasher.update(stable_id.as_bytes());
     let digest = hasher.finalize();
     let mut out = String::from("acct_");
-    // 12 hex chars = 6 bytes of entropy. Plenty for ~hundreds of accounts
-    // before any practical collision risk; short enough to be readable.
     for byte in digest.iter().take(6) {
         out.push_str(&format!("{byte:02x}"));
     }
@@ -100,58 +92,15 @@ fn credentials_path() -> Option<std::path::PathBuf> {
     Some(dirs::home_dir()?.join(".claude").join(".credentials.json"))
 }
 
-fn parse_access_token(content: &str) -> Option<String> {
+/// Extract the top-level `organizationUuid` field from the JSON content
+/// of `.credentials.json`. Returns None if the field is missing or not
+/// a string — both cases mean the credentials file doesn't have the
+/// shape we need to identify the account.
+fn parse_organization_uuid(content: &str) -> Option<String> {
     let json: serde_json::Value = serde_json::from_str(content).ok()?;
-    json.get("claudeAiOauth")?
-        .get("accessToken")?
+    json.get("organizationUuid")?
         .as_str()
         .map(str::to_string)
-}
-
-/// Decode base64url (no padding tolerated either way). Returns `None`
-/// on any malformed input. Hand-rolled to avoid pulling in a base64
-/// crate just for this one call site.
-fn base64url_decode(input: &str) -> Option<Vec<u8>> {
-    const ALPHABET: &[u8] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut lookup = [255u8; 256];
-    for (i, &c) in ALPHABET.iter().enumerate() {
-        lookup[c as usize] = i as u8;
-    }
-
-    // Strip any padding ('=') and ignore whitespace.
-    let cleaned: Vec<u8> = input
-        .bytes()
-        .filter(|&b| b != b'=' && !b.is_ascii_whitespace())
-        .collect();
-
-    let mut out = Vec::with_capacity(cleaned.len() * 3 / 4 + 3);
-    let mut buf: u32 = 0;
-    let mut bits: u32 = 0;
-    for byte in cleaned {
-        let v = lookup[byte as usize];
-        if v == 255 {
-            return None;
-        }
-        buf = (buf << 6) | v as u32;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buf >> bits) as u8 & 0xFF);
-        }
-    }
-    // After the loop, valid (de-padded) inputs leave `bits` at 0, 2, or 4.
-    // `bits == 6` indicates a length mod 4 == 1, which is never produced by
-    // a canonical base64 encoder. Reject it. Similarly, any leftover bits
-    // must be zero — non-zero leftovers come from corrupt or truncated
-    // encodings rather than legitimate decoders.
-    if bits >= 6 {
-        return None;
-    }
-    if bits > 0 && (buf & ((1 << bits) - 1)) != 0 {
-        return None;
-    }
-    Some(out)
 }
 
 #[cfg(test)]
@@ -160,55 +109,58 @@ mod tests {
 
     #[test]
     fn format_account_id_is_stable_and_short() {
-        let a = format_account_id("auth0|abc123");
-        let b = format_account_id("auth0|abc123");
+        let a = format_account_id("550e8400-e29b-41d4-a716-446655440000");
+        let b = format_account_id("550e8400-e29b-41d4-a716-446655440000");
         assert_eq!(a, b);
         assert_eq!(a.len(), 17); // "acct_" + 12 hex chars
         assert!(a.starts_with("acct_"));
     }
 
     #[test]
-    fn format_account_id_differs_per_sub() {
-        let a = format_account_id("auth0|abc123");
-        let b = format_account_id("auth0|def456");
+    fn format_account_id_differs_per_org() {
+        let a = format_account_id("550e8400-e29b-41d4-a716-446655440000");
+        let b = format_account_id("00000000-0000-0000-0000-000000000001");
         assert_ne!(a, b);
     }
 
     #[test]
-    fn base64url_decode_roundtrip_known_vector() {
-        // "Hello" base64url-encoded
-        assert_eq!(base64url_decode("SGVsbG8").unwrap(), b"Hello");
-        // With padding tolerated
-        assert_eq!(base64url_decode("SGVsbG8=").unwrap(), b"Hello");
-        // URL-safe '-' and '_' alphabet exercised.
-        // a-_z = (26, 62, 63, 51) in the alphabet, 6 bits each:
-        // 011010 111110 111111 110011 = 0x6B 0xEF 0xF3
-        assert_eq!(base64url_decode("a-_z").unwrap(), vec![0x6b, 0xef, 0xf3]);
+    fn parse_organization_uuid_happy_path() {
+        let content = r#"{
+            "claudeAiOauth": {"accessToken":"sk-ant-oat01-…","refreshToken":"sk-ant-oat01-…"},
+            "organizationUuid": "550e8400-e29b-41d4-a716-446655440000"
+        }"#;
+        assert_eq!(
+            parse_organization_uuid(content).as_deref(),
+            Some("550e8400-e29b-41d4-a716-446655440000")
+        );
     }
 
     #[test]
-    fn derive_from_jwt_handles_typical_payload() {
-        // Build a synthetic JWT: header.payload.sig where payload contains sub.
-        // base64url("{\"sub\":\"auth0|user-xyz\"}") = eyJzdWIiOiJhdXRoMHx1c2VyLXh5eiJ9
-        let jwt = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJhdXRoMHx1c2VyLXh5eiJ9.ignored";
-        let id = derive_from_jwt(jwt).expect("should derive");
-        assert!(id.starts_with("acct_"));
-        assert_eq!(id.len(), 17);
+    fn parse_organization_uuid_missing_field_returns_none() {
+        let content = r#"{"claudeAiOauth": {"accessToken":"sk-ant-oat01-…"}}"#;
+        assert_eq!(parse_organization_uuid(content), None);
     }
 
     #[test]
-    fn derive_from_jwt_rejects_garbage() {
-        assert_eq!(derive_from_jwt("not-a-jwt"), None);
-        assert_eq!(derive_from_jwt("only.two.dots.thing.here"), None);
-        assert_eq!(derive_from_jwt("foo.!!!.bar"), None);
+    fn parse_organization_uuid_wrong_type_returns_none() {
+        let content = r#"{"organizationUuid": 12345}"#;
+        assert_eq!(parse_organization_uuid(content), None);
     }
 
     #[test]
-    fn base64url_decode_rejects_mod4_length_1() {
-        // A single base64 char encodes only 6 bits — never produced by a
-        // canonical encoder. Reject it rather than silently dropping the
-        // 6-bit remainder.
-        assert_eq!(base64url_decode("A"), None);
-        assert_eq!(base64url_decode("AAAAA"), None); // 4+1 == 5
+    fn parse_organization_uuid_malformed_json_returns_none() {
+        assert_eq!(parse_organization_uuid("not json"), None);
+        assert_eq!(parse_organization_uuid(""), None);
+    }
+
+    #[test]
+    fn full_pipeline_for_known_uuid() {
+        // Verify end-to-end: known uuid → known account_id. Stable signal
+        // (not a function of token rotation) so this is safe to pin in
+        // test code as a regression guard.
+        let content = r#"{"organizationUuid": "550e8400-e29b-41d4-a716-446655440000"}"#;
+        let uuid = parse_organization_uuid(content).unwrap();
+        let id = format_account_id(&uuid);
+        assert_eq!(id, "acct_a3a9e1ed9732");
     }
 }
