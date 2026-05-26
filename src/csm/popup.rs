@@ -360,17 +360,15 @@ unsafe fn paint_chart(
         .filter(|h| h.used_pct.is_some())
         .collect();
 
-    let (session_start, session_end, known_session) = match refresh_unix {
-        Some(end) => (end - 5 * 3600, end, true),
-        None => {
-            if let Some(first) = truths.first() {
-                (first.computed_unix, now_unix.max(first.computed_unix + 60), false)
-            } else {
+    let earliest_truth_unix = truths.first().map(|h| h.computed_unix);
+    let (session_start, session_end, known_session) =
+        match compute_session_window(refresh_unix, earliest_truth_unix, now_unix) {
+            Some(tuple) => tuple,
+            None => {
                 draw_hint(hdc, "no snapshots yet", plot_left + 4, plot_top + 4);
                 return;
             }
-        }
-    };
+        };
 
     let t_range = (session_end - session_start).max(60) as f64;
     let time_to_x = |t: i64| -> i32 {
@@ -670,4 +668,118 @@ unsafe fn draw_text_left(
         &mut rect,
         DT_LEFT | DT_SINGLELINE | DT_NOPREFIX,
     );
+}
+
+/// Computes the chart's X-axis range (and whether the right edge is a
+/// real session-refresh marker or just a "now-ish" placeholder).
+/// Returns `None` for the cold-cold case — no refresh-at AND no history
+/// — so the caller can emit the "no snapshots yet" hint.
+///
+/// `earliest_truth_unix` is the timestamp of the *oldest* in-store
+/// history entry. The per-account `VecDeque` populated by
+/// `prediction_store::push` preserves insertion order, and the
+/// predictor emits entries chronologically (startup backfill from
+/// `history.jsonl` in append order, then live observations), so
+/// `truths.first()` is the oldest.
+///
+/// When `refresh_unix` is known but the per-account history is sparse
+/// (e.g. just after a mid-session `claude login` switch — the new
+/// account has no history on this machine yet), `session_start` narrows
+/// to the first observation rather than stretching all the way back to
+/// `refresh - 5h`. Without this, the empty stretch reads as a flat 0%
+/// line against the gridlines.
+///
+/// Phase 7e cross-machine sync will eventually backfill that history,
+/// at which point the `max(nominal, observed)` reverts to picking
+/// `nominal` automatically — no further code change needed.
+///
+/// See [`docs/ACCOUNT-SWITCH-COLDSTART-FIX.md`](../../../docs/ACCOUNT-SWITCH-COLDSTART-FIX.md).
+fn compute_session_window(
+    refresh_unix: Option<i64>,
+    earliest_truth_unix: Option<i64>,
+    now_unix: i64,
+) -> Option<(i64, i64, bool)> {
+    match refresh_unix {
+        Some(end) => {
+            let nominal_start = end - 5 * 3600;
+            let observed_start = earliest_truth_unix.unwrap_or(nominal_start);
+            Some((nominal_start.max(observed_start), end, true))
+        }
+        None => earliest_truth_unix
+            .map(|first| (first, now_unix.max(first + 60), false)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_session_window;
+
+    const FIVE_H: i64 = 5 * 3600;
+    const NOW: i64 = 1_700_000_000;
+
+    #[test]
+    fn refresh_known_with_history_extending_past_nominal_uses_nominal_window() {
+        // Long-running session where we have all 5 hours of history.
+        let end = NOW + 3600;
+        let nominal = end - FIVE_H;
+        let earliest = nominal - 100; // older than the 5h window
+        let (start, session_end, known) =
+            compute_session_window(Some(end), Some(earliest), NOW).unwrap();
+        assert_eq!(start, nominal, "older-than-nominal data doesn't widen the window");
+        assert_eq!(session_end, end);
+        assert!(known);
+    }
+
+    #[test]
+    fn refresh_known_with_sparse_history_narrows_to_first_observation() {
+        // The post-account-switch case the fix targets.
+        let end = NOW + 4 * 3600;
+        let switch_time = NOW - 60; // only 1 minute of history
+        let (start, session_end, known) =
+            compute_session_window(Some(end), Some(switch_time), NOW).unwrap();
+        assert_eq!(start, switch_time);
+        assert_eq!(session_end, end);
+        assert!(known);
+    }
+
+    #[test]
+    fn refresh_known_with_no_history_keeps_nominal_window() {
+        // Drawing path still continues; the chart's later
+        // `in_session.is_empty()` check fires the "no snapshots in
+        // session yet" hint elsewhere.
+        let end = NOW + 3600;
+        let nominal = end - FIVE_H;
+        let (start, session_end, known) =
+            compute_session_window(Some(end), None, NOW).unwrap();
+        assert_eq!(start, nominal);
+        assert_eq!(session_end, end);
+        assert!(known);
+    }
+
+    #[test]
+    fn refresh_unknown_with_history_uses_open_ended_window() {
+        let first = NOW - 300;
+        let (start, session_end, known) =
+            compute_session_window(None, Some(first), NOW).unwrap();
+        assert_eq!(start, first);
+        assert_eq!(session_end, NOW, "now > first+60 so session_end == now");
+        assert!(!known);
+    }
+
+    #[test]
+    fn refresh_unknown_with_only_just_now_history_pads_to_60s_minimum() {
+        // Fresh observation arrived in the same tick as `now`.
+        let first = NOW;
+        let (start, session_end, _) =
+            compute_session_window(None, Some(first), NOW).unwrap();
+        assert_eq!(start, first);
+        assert_eq!(session_end, first + 60, "60s minimum visible span");
+    }
+
+    #[test]
+    fn cold_cold_case_returns_none_for_hint() {
+        // No refresh-at and no history — caller emits the "no
+        // snapshots yet" hint and bails out.
+        assert!(compute_session_window(None, None, NOW).is_none());
+    }
 }
