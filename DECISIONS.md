@@ -442,3 +442,54 @@ That investigation ran today (track C of the 2026-05-26 session). Results:
 - The McAfee Endpoint Security alternative-hypothesis path investigated in track C is no longer needed. No IT escalation is required. The `ElevationServiceSupport: Blocked` policy noted in ADR-013 still applies to VS Build Tools updates, but does not affect the build or run path.
 - Phase 7e (Worker sync integration) can now use local smoke-test cycles rather than CI round-trips. No phase work was blocked by the prior misdiagnosis (CI artifacts were a working fallback) but the speed-up materially helps iteration.
 
+---
+
+## ADR-015: Retire the CodeZeno fork; rebuild as a single-stack C# own-widget with web-session multi-account polling
+
+**Date:** 2026-05-27
+**Status:** Accepted (direction set; de-risk spikes pending before build commitment). Supersedes ADR-001 (the original decision to fork CodeZeno) for all forward work. Phases 0–7 of the fork are frozen as a working reference + a source of portable C# (the predictor).
+
+### Context — why the fork no longer fits
+
+ADR-001 (2026-05-13) chose to fork CodeZeno/Claude-Code-Usage-Monitor over reviving the predecessor's own widget (Claude Session Monitor, WinUI 3 + WebView2 scraping). The fork's draws were: (a) a clean taskbar-embedded widget, (b) the undocumented OAuth usage endpoint `api.anthropic.com/api/oauth/usage`, (c) zero-install + self-update + i18n. We built seven phases on it: a Rust-host ↔ C#-predictor sidecar over line-delimited JSON IPC, the three-tier prediction model, the hover popover, the companion badge, and multi-auth scaffolding (7a–7c).
+
+Then the maintainer's goal crystallised into three requirements the fork's architecture cannot meet:
+
+1. **Live usage for all three accounts simultaneously**, not just whichever is active in VS Code.
+2. **Runout prediction on the active account** (this part works today).
+3. **One-click account switching.**
+
+The blockers that forced this re-evaluation:
+
+- **Single-active-account is baked in.** The fork reads `~/.claude/.credentials.json`, which the Claude CLI overwrites to hold exactly one account. Polling all three needs a credential-management layer the fork's design has no place for. Cross-machine sync (the planned 7e) only ever shows accounts active *somewhere* — never three-at-once on one machine.
+- **No stable per-account identity via the API path.** `.credentials.json` has no email/user id. `organizationUuid` is present for only 1 of the maintainer's 3 accounts (work account "Work 2" has it; "Work 1" and Personal don't), so it's unusable. The only per-account signal is the opaque `sk-ant-oat01-…` tokens.
+- **Refresh-token rotation is the wall.** The maintainer confirmed he expects tokens to rotate and does not want to build/maintain OAuth refresh machinery. A widget that polls non-active accounts via the OAuth API would have to refresh their tokens itself — and if tokens rotate, that **invalidates the Claude CLI's stored session** for those accounts, silently logging the user out. So the "widget as OAuth client" path is both unwanted and unsafe.
+- **Toolchain drag.** The Rust+C# split cost weeks of toolchain debugging (ADRs 005, 010, 013, 014 — the gnullvm/cargo-xwin/MSVC saga). A single language stack removes that whole class of problem.
+
+Re-weighing the fork's original draws against today's requirements:
+
+- The **OAuth endpoint** was never a moat — it's a plain authenticated HTTP GET, callable from any stack. And it's now the *wrong* data source (single-account, rotation-bound).
+- **i18n** (8-language UI translations in `src/localization/`) has zero value for a solo English-speaking maintainer.
+- **Self-update** is minor for a personal tool.
+- **Taskbar embedding** is the fork's only durable unique value — *and it is reproducible.* The "impossible for our own widget" claim from the WinUI-3 era was a framework limitation (WinUI 3 renders sandboxed app windows and cannot dock in the tray). CodeZeno achieves it with **raw Win32** (a child window under `Shell_TrayWnd` with tray-anchor positioning), and **.NET can call every one of those Win32 APIs via P/Invoke**. So a single-stack C# widget can embed in the taskbar without WinUI 3.
+
+### Decision
+
+Rebuild as a **single-stack C# / .NET own-widget**:
+
+- **Data layer: web-session polling, one persistent session per account.** Revive the predecessor's hard-won non-API approach (cookie-based authenticated web sessions, one per account, via WebView2). This sidesteps OAuth token rotation entirely — the browser session machinery owns the auth lifecycle; we never write refresh-token code. Three sessions = three accounts polled (~30s cadence for idle accounts; the maintainer is comfortable with the ToS footprint at that rate). Prefer intercepting the usage *network call* the web app makes over scraping the visible DOM, for robustness.
+- **Shell: raw Win32 taskbar embedding from C# (P/Invoke), not WinUI 3.** Reproduces the fork's one durable asset in our own stack.
+- **Identity is solved by construction.** The widget owns three labelled credential/session sets, so "which account is this" needs no hashing of rotating tokens — it's known. The alias-linking problem dissolves.
+- **Predictor ports over directly.** The three-tier model (Tier 1 burn-rate, Tier 2 Monte Carlo, Tier 3 Hawkes), idle-freeze, and JSONL persistence are already C# and lift from the fork with minimal change.
+- **One-click switching becomes near-free** once the widget manages all three sessions/credentials — switching is selecting which one is "active" (mechanism TBD — see open questions).
+
+The forward roadmap, spikes, and open questions live in [`docs/REBUILD-PLAN.md`](docs/REBUILD-PLAN.md).
+
+### Consequences
+
+- **Phases 0–7 of the fork are frozen, not deleted.** The repo stays as a working reference and the source-of-truth for the portable predictor code. Whether the rebuild is a new repo or an in-place restructure is an open question (see the plan doc); leaning toward a new project that imports the predictor.
+- **We lose** upstream's ongoing maintenance, self-update, and i18n. None are valued; the divergence from upstream was already making the daily sync workflow more liability than asset.
+- **We take on** reimplementing taskbar embedding in C# P/Invoke (the main cost — CodeZeno's Rust host carries real accumulated Win32 know-how: tray-anchor positioning, DPI scaling, surviving `explorer.exe` restarts), accepting WebView2 scraping brittleness (the original reason ADR-001 left it — mitigated by network-intercept over DOM-scrape), and ~300-600 MB RAM for three Chromium sessions.
+- **De-risk before committing.** Two spikes gate the rebuild: (A) raw-Win32 taskbar child-window embedding from C#; (B) two concurrent persistent WebView2 sessions each reading a different account's usage. If both succeed, build with confidence; if the taskbar spike fights us, reconsider keeping CodeZeno's shell as a thin renderer driven by the C# data layer.
+- **Lesson:** a fork is the right call when you need most of what upstream does and will stay close to it. It stops paying off the moment your requirements diverge from upstream's core model — here, the moment "multi-account" collided with upstream's single-account premise. The sunk seven phases weren't wasted (the predictor and the prediction/UX design carry over), but the shell was always going to be a poor fit for a goal upstream doesn't share.
+
