@@ -1,5 +1,9 @@
 # Claude-Usage-Projector — fork context
 
+> **⚠ RETIRED / FROZEN as of 2026-05-27.** This fork is no longer the active project. Development moved back to a single-stack **C# own-widget** (the "Claude Session Monitor" rebuild). The full reasoning is in [`DECISIONS.md`](DECISIONS.md) **ADR-015**; the forward roadmap is in [`docs/REBUILD-PLAN.md`](docs/REBUILD-PLAN.md).
+>
+> **If you're a future Claude agent landing here:** don't build new features on this repo. It is kept as (a) a working reference implementation and (b) the source of the portable C# **predictor** (`predictor/` — the three-tier Tier 1/2/3 model, idle-freeze, and JSONL persistence port directly into the rebuild). Everything below describes the fork's *frozen* state, **not a live roadmap** — the phase table in particular is historical. It was retired because its single-active-account + OAuth-API model could not deliver simultaneous live tracking of three accounts: there's no stable per-account identity in `~/.claude/.credentials.json` (`organizationUuid` is present for only some accounts; the rest is opaque rotating tokens), refresh-token rotation makes API polling of idle accounts unsafe, and the Rust+C# split was a recurring toolchain drag. The rebuild uses per-account WebView2 cookie-sessions (no OAuth refresh code) and raw-Win32 taskbar embedding from C#. See ADR-015 for the whole story.
+
 > This file orients a Claude Code session opening this repo for the first time. The upstream `README.md` describes the original CodeZeno app — read this for what's different in **this fork**.
 
 ## What this project is
@@ -49,7 +53,9 @@ See [`docs/BUILD.md`](docs/BUILD.md) for full step-by-step instructions on each 
 
 **Local builds on the maintainer's machine work.** `cargo build --release` produces a runnable host binary directly. The earlier "USER32 0x35532 crash" claim was a misattribution — a stale `rustup override` was routing the build through gnullvm despite ADR-013 declaring MSVC canonical. `rustup override unset` from inside the repo dropped the override; dumpbin diff between CI and local MSVC binaries showed only LTO-noise (timestamps, PDB GUIDs, ~0x100-byte address shifts) with no behaviourally-significant differences. See ADR-014 in [`DECISIONS.md`](DECISIONS.md).
 
-## Phase plan (forward-looking)
+## Phase plan (HISTORICAL — project frozen 2026-05-27, see ADR-015)
+
+> This table is the frozen record of what shipped on the fork. It is **not** a live roadmap — Phase 7d/7e and Phase 8 will not be built here. Forward work is in [`docs/REBUILD-PLAN.md`](docs/REBUILD-PLAN.md).
 
 | Phase | Status | Scope |
 |---|---|---|
