@@ -1,8 +1,27 @@
 name: upstream-sync
 
 # Daily attempt to merge upstream/main (CodeZeno/Claude-Code-Usage-Monitor)
-# into our main. Clean merges are pushed automatically; conflicts cause the
-# workflow to fail visibly — resolve manually from a local clone.
+# into our main.
+#
+# It runs on windows-latest and compiles the result BEFORE pushing, because nothing
+# downstream will: GitHub does not create a workflow run from a push authenticated
+# with GITHUB_TOKEN, so build-host.yml never sees a merge this job publishes. This
+# job therefore has to check its own work.
+#
+# WHAT THAT COVERS, and what it does not. It builds the Rust host and nothing else.
+# build-predictor.yml and release.yml are triggered by push too, so the same rule
+# means they never run on a merge from here either - the C# predictor and anything
+# else in the tree go out UNVERIFIED. Today upstream carries no files under
+# predictor/ at all, so the gap is theoretical for this upstream; it stops being
+# theoretical the day that changes.
+#
+# It also changes what this job trusts: compiling a merged tree runs upstream's
+# build.rs, build scripts and proc macros, unattended, in a job holding write access
+# to a public repo. That is the price of not publishing unverified code, and it is a
+# deliberate trade rather than an oversight.
+#
+# A lockfile-only conflict is resolved here by regenerating the lockfile. Any other
+# conflict still fails visibly - resolve manually from a local clone.
 
 on:
   schedule:
@@ -12,11 +31,33 @@ on:
 permissions:
   contents: write
 
+# The cron and a manual dispatch can otherwise overlap, and two jobs pushing main is
+# the same race this repo's siblings had to fix. Never cancel one mid-push. A third
+# run arriving while one is queued does cancel the queued one, which is harmless
+# here: every run does the same work and the next one picks up whatever is left.
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
 jobs:
   sync:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    runs-on: windows-latest
+    # A cold Windows release build of this dependency graph, uncached, with no
+    # cargo cache. 45 rather than build-host.yml's 30 because that number predates
+    # the eframe 0.35 GUI stack that upstream/main's Cargo.toml now pulls in. It
+    # only does real work on days upstream actually moved, and the repo is public,
+    # so the minutes are free.
+    timeout-minutes: 45
     steps:
+      # Before checkout, deliberately. The runner's git would otherwise rewrite line
+      # endings on checkout, and every file in this repo is committed with LF.
+      - name: Keep line endings as committed
+        run: git config --global core.autocrlf false
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -36,7 +77,16 @@ jobs:
       - name: Count upstream commits ahead
         id: ahead
         run: |
-          AHEAD=$(git rev-list --count HEAD..upstream/main)
+          if ! AHEAD=$(git rev-list --count HEAD..upstream/main); then
+            echo "Could not count upstream commits."
+            exit 1
+          fi
+          # An empty count would make every `!= '0'` below true, running the merge
+          # and the push against a state this step could not read.
+          if [ -z "$AHEAD" ]; then
+            echo "Upstream commit count came back empty."
+            exit 1
+          fi
           echo "count=$AHEAD" >> "$GITHUB_OUTPUT"
           echo "Upstream is $AHEAD commits ahead of main"
 
@@ -46,7 +96,60 @@ jobs:
 
       - name: Merge upstream/main
         if: steps.ahead.outputs.count != '0'
-        run: git merge --no-edit upstream/main
+        run: |
+          if git merge --no-edit upstream/main; then
+            echo "Merged cleanly."
+            exit 0
+          fi
+
+          # Cargo.lock is co-edited by both sides on almost every sync, so this
+          # conflict is structural rather than occasional. It is also the one conflict
+          # that must never be resolved by hand: the hunks are interleaved alphabetical
+          # package blocks, and picking lines out of them yields a dependency set
+          # nobody chose. Regenerating is the only correct resolution - and only when
+          # the lockfile is the ONLY thing in conflict.
+          CONFLICTS=$(git diff --name-only --diff-filter=U)
+          if [ "$CONFLICTS" != "Cargo.lock" ]; then
+            echo "Cannot resolve automatically. Conflicted files:"
+            echo "${CONFLICTS:-(none - the merge failed for a reason other than a conflict)}"
+            git merge --abort || true
+            exit 1
+          fi
+
+          # Seed from our side so the pins this binary was built against are kept.
+          # The next step re-resolves against the MERGED Cargo.toml, which is what
+          # picks up everything upstream newly requires.
+          git checkout --ours Cargo.lock
+          git add Cargo.lock
+          git commit --no-edit
+          echo "Lockfile-only conflict; seeded from our side, regenerating next."
+
+      # Runs after BOTH paths, because a clean merge is not a safe one: git will
+      # happily auto-merge two lockfiles into valid TOML that no longer describes
+      # what Cargo.toml asks for. `cargo metadata` re-resolves and rewrites the lock
+      # without compiling anything.
+      - name: Regenerate the lockfile against the merged manifest
+        if: steps.ahead.outputs.count != '0'
+        run: |
+          if ! cargo metadata --format-version 1 > /dev/null; then
+            echo "cargo could not resolve the merged dependency set."
+            exit 1
+          fi
+          if git diff --quiet -- Cargo.lock; then
+            echo "Cargo.lock already matched the merged manifest."
+          else
+            git add Cargo.lock
+            git commit -m "ci: regenerate Cargo.lock after the upstream merge"
+            echo "Cargo.lock regenerated."
+          fi
+
+      # The gate. --release matches what build-host.yml actually ships, so this is
+      # the same compilation a human would trust. --locked does a second job: it
+      # asserts the committed lockfile is exactly what cargo wants, so a lock that
+      # drifted from Cargo.toml fails here rather than on someone's machine.
+      - name: Verify the merged tree compiles
+        if: steps.ahead.outputs.count != '0'
+        run: cargo build --release --locked
 
       - name: Push merged main
         if: steps.ahead.outputs.count != '0'
