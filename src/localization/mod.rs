@@ -1,14 +1,6 @@
-mod dutch;
-mod english;
-mod french;
-mod german;
-mod japanese;
-mod korean;
-mod portuguese_brazil;
-mod russian;
-mod simplified_chinese;
-mod spanish;
-mod traditional_chinese;
+// Keep the complete translation catalogue while the GPU dashboard progressively
+// adopts the legacy widget strings.
+#![allow(dead_code)]
 
 use windows::core::PWSTR;
 use windows::Win32::Globalization::{
@@ -16,97 +8,87 @@ use windows::Win32::Globalization::{
     LCIDToLocaleName, LOCALE_ALLOW_NEUTRAL_NAMES, MAX_LOCALE_NAME, MUI_LANGUAGE_NAME,
 };
 
+use crate::providers::ProviderId;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LanguageId {
-    English,
-    Dutch,
-    Spanish,
-    French,
-    German,
-    Japanese,
-    Korean,
-    TraditionalChinese,
-    SimplifiedChinese,
-    Russian,
-    PortugueseBrazil,
+pub struct LanguageId(usize);
+
+struct Locale {
+    code: &'static str,
+    native_name: &'static str,
+    locale_patterns: &'static [&'static str],
+    windows_font: Option<(&'static str, &'static str)>,
+    update_via_winget_label: &'static str,
+    strings: Strings,
+    translations: &'static [(&'static str, &'static str)],
+}
+
+mod generated {
+    use super::{LanguageId, Locale, Strings};
+
+    include!(concat!(env!("OUT_DIR"), "/locales.rs"));
 }
 
 impl LanguageId {
-    pub const ALL: [LanguageId; 11] = [
-        LanguageId::English,
-        LanguageId::Dutch,
-        LanguageId::Spanish,
-        LanguageId::French,
-        LanguageId::German,
-        LanguageId::Japanese,
-        LanguageId::Korean,
-        LanguageId::TraditionalChinese,
-        LanguageId::SimplifiedChinese,
-        LanguageId::Russian,
-        LanguageId::PortugueseBrazil,
-    ];
+    #[allow(non_upper_case_globals)]
+    pub const English: Self = Self(generated::ENGLISH_INDEX);
+
+    pub const ALL: [Self; generated::LANGUAGE_COUNT] = generated::LANGUAGE_IDS;
+
+    fn locale(self) -> &'static Locale {
+        &generated::LOCALES[self.0]
+    }
 
     pub fn code(self) -> &'static str {
-        match self {
-            Self::English => "en",
-            Self::Dutch => "nl",
-            Self::Spanish => "es",
-            Self::French => "fr",
-            Self::German => "de",
-            Self::Japanese => "ja",
-            Self::Korean => "ko",
-            Self::TraditionalChinese => "zh-TW",
-            Self::SimplifiedChinese => "zh-CN",
-            Self::Russian => "ru",
-            Self::PortugueseBrazil => "pt-BR",
-        }
+        self.locale().code
     }
 
     pub fn native_name(self) -> &'static str {
-        match self {
-            Self::English => "English",
-            Self::Dutch => "Nederlands",
-            Self::Spanish => "Español",
-            Self::French => "Français",
-            Self::German => "Deutsch",
-            Self::Japanese => "日本語",
-            Self::Korean => "한국어",
-            Self::TraditionalChinese => "繁體中文",
-            Self::SimplifiedChinese => "简体中文",
-            Self::Russian => "Русский",
-            Self::PortugueseBrazil => "Português (Brasil)",
-        }
+        self.locale().native_name
     }
 
     pub fn strings(self) -> Strings {
-        match self {
-            Self::English => english::STRINGS,
-            Self::Dutch => dutch::STRINGS,
-            Self::Spanish => spanish::STRINGS,
-            Self::French => french::STRINGS,
-            Self::German => german::STRINGS,
-            Self::Japanese => japanese::STRINGS,
-            Self::Korean => korean::STRINGS,
-            Self::TraditionalChinese => traditional_chinese::STRINGS,
-            Self::SimplifiedChinese => simplified_chinese::STRINGS,
-            Self::Russian => russian::STRINGS,
-            Self::PortugueseBrazil => portuguese_brazil::STRINGS,
-        }
+        self.locale().strings
+    }
+
+    /// Translate user-interface text introduced by the dashboard and Theme Studio.
+    ///
+    /// English text is used as the stable catalogue key. Locale modules may
+    /// deliberately fall back to that key while a specialist term is awaiting
+    /// a reviewed translation.
+    pub fn text(self, english: &'static str) -> &'static str {
+        let locale = self.locale();
+        locale
+            .translations
+            .binary_search_by(|(key, _)| (*key).cmp(english))
+            .map(|index| locale.translations[index].1)
+            .unwrap_or(english)
     }
 
     pub fn update_via_winget_label(self) -> &'static str {
-        match self {
-            Self::English => english::UPDATE_VIA_WINGET_LABEL,
-            Self::Dutch => dutch::UPDATE_VIA_WINGET_LABEL,
-            Self::Spanish => spanish::UPDATE_VIA_WINGET_LABEL,
-            Self::French => french::UPDATE_VIA_WINGET_LABEL,
-            Self::German => german::UPDATE_VIA_WINGET_LABEL,
-            Self::Japanese => japanese::UPDATE_VIA_WINGET_LABEL,
-            Self::Korean => korean::UPDATE_VIA_WINGET_LABEL,
-            Self::TraditionalChinese => traditional_chinese::UPDATE_VIA_WINGET_LABEL,
-            Self::SimplifiedChinese => simplified_chinese::UPDATE_VIA_WINGET_LABEL,
-            Self::Russian => russian::UPDATE_VIA_WINGET_LABEL,
-            Self::PortugueseBrazil => portuguese_brazil::UPDATE_VIA_WINGET_LABEL,
+        self.locale().update_via_winget_label
+    }
+
+    pub fn provider_auth_error(self, provider: ProviderId) -> (&'static str, &'static str) {
+        let strings = self.strings();
+        match provider {
+            ProviderId::Claude => (strings.token_expired_title, strings.token_expired_body),
+            ProviderId::Codex => (
+                strings.codex_token_expired_title,
+                strings.codex_token_expired_body,
+            ),
+            ProviderId::Antigravity => (
+                strings.antigravity_token_expired_title,
+                strings.antigravity_token_expired_body,
+            ),
+            ProviderId::OpenCode => (
+                strings.opencode_token_expired_title,
+                strings.opencode_token_expired_body,
+            ),
+            ProviderId::Cursor => (
+                strings.cursor_token_expired_title,
+                strings.cursor_token_expired_body,
+            ),
         }
     }
 
@@ -116,30 +98,26 @@ impl LanguageId {
             return None;
         }
 
-        let prefix = normalized.split('-').next().unwrap_or_default();
-        match prefix {
-            "en" => Some(Self::English),
-            "nl" => Some(Self::Dutch),
-            "es" => Some(Self::Spanish),
-            "fr" => Some(Self::French),
-            "de" => Some(Self::German),
-            "ja" => Some(Self::Japanese),
-            "ko" => Some(Self::Korean),
-            "zh" => {
-                if normalized.contains("tw")
-                    || normalized.contains("hk")
-                    || normalized.contains("mo")
-                    || normalized.contains("hant")
-                {
-                    Some(Self::TraditionalChinese)
-                } else {
-                    Some(Self::SimplifiedChinese)
-                }
-            }
-            "ru" => Some(Self::Russian),
-            "pt" => Some(Self::PortugueseBrazil),
-            _ => None,
-        }
+        Self::ALL.into_iter().find(|language| {
+            language.locale().locale_patterns.iter().any(|pattern| {
+                normalized == *pattern
+                    || normalized
+                        .strip_prefix(pattern)
+                        .is_some_and(|suffix| suffix.starts_with('-'))
+            })
+        })
+    }
+
+    pub(crate) fn index(self) -> usize {
+        self.0
+    }
+
+    pub(crate) fn from_index(index: usize) -> Option<Self> {
+        (index < generated::LANGUAGE_COUNT).then_some(Self(index))
+    }
+
+    pub(crate) fn windows_font(self) -> Option<(&'static str, &'static str)> {
+        self.locale().windows_font
     }
 }
 
@@ -156,9 +134,10 @@ pub struct Strings {
     pub claude_code_model: &'static str,
     pub codex_model: &'static str,
     pub antigravity_model: &'static str,
+    pub opencode_model: &'static str,
+    pub cursor_model: &'static str,
     pub settings: &'static str,
     pub start_with_windows: &'static str,
-    pub reset_position: &'static str,
     pub language: &'static str,
     pub system_default: &'static str,
     pub check_for_updates: &'static str,
@@ -173,9 +152,10 @@ pub struct Strings {
     pub update_available: &'static str,
     pub update_prompt_now: &'static str,
     pub exit: &'static str,
-    pub show_widget: &'static str,
     pub session_window: &'static str,
     pub weekly_window: &'static str,
+    pub cursor_auto_window: &'static str,
+    pub cursor_api_window: &'static str,
     pub now: &'static str,
     pub day_suffix: &'static str,
     pub hour_suffix: &'static str,
@@ -187,8 +167,14 @@ pub struct Strings {
     pub codex_token_expired_body: &'static str,
     pub antigravity_token_expired_title: &'static str,
     pub antigravity_token_expired_body: &'static str,
+    pub opencode_token_expired_title: &'static str,
+    pub opencode_token_expired_body: &'static str,
+    pub cursor_token_expired_title: &'static str,
+    pub cursor_token_expired_body: &'static str,
     pub codex_window_title: &'static str,
     pub antigravity_window_title: &'static str,
+    pub opencode_window_title: &'static str,
+    pub cursor_window_title: &'static str,
 }
 
 pub fn resolve_language(language_override: Option<LanguageId>) -> LanguageId {
@@ -270,5 +256,134 @@ fn default_locale_name() -> Option<LanguageId> {
         }
         let locale = String::from_utf16_lossy(&buffer[..(len as usize - 1)]);
         LanguageId::from_code(&locale)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_non_english_locale_translates_the_primary_dashboard_workflow() {
+        let keys = [
+            "Open Dashboard",
+            "Theme Studio",
+            "Assets",
+            "Every 5 minutes",
+            "Enabled",
+            "Active theme",
+            "Save changes?",
+            "Save and continue",
+            "Discard changes",
+            "Cancel",
+            "New theme",
+            "Create",
+            "Duplicate theme",
+            "Create copy",
+            "Delete theme?",
+            "Delete theme",
+            "Delete asset?",
+            "Delete",
+            "Scene",
+            "Add layer",
+            "Background",
+            "Content type",
+            "Apply",
+            "Import...",
+            "Export...",
+            "Import a theme or package",
+            "Export theme package",
+            "Unable to import theme",
+            "Unable to export theme package",
+            "Save or discard changes before importing",
+            "Add images once, reuse them across themes, or drop image files here to import them.",
+            "Theme Studio packages and themes",
+            "Theme packages",
+            "Theme files",
+            "All files",
+            "Theme Studio packages",
+            "Images",
+            "Action helper",
+            "Build safe mouse actions that affect layers at runtime.",
+            "Choose one action for this context menu item.",
+            "Enter actions...",
+            "Show dashboard",
+            "Toggle dashboard",
+            "Context Menus",
+            "Show context menu",
+            "Set property",
+            "Reset property",
+            "Increase value",
+            "Decrease value",
+            "Run layer actions",
+            "Show widget",
+            "Check for updates",
+            "Name the new theme",
+            "Theme name",
+            "Name the editable copy",
+            "Are you sure you want to delete {name}?",
+            "Delete context menu?",
+            "Delete context menu",
+            "Are you sure you want to delete {name} from the asset library and all themes using it?",
+        ];
+
+        for language in LanguageId::ALL
+            .into_iter()
+            .filter(|language| *language != LanguageId::English)
+        {
+            for key in keys {
+                assert_ne!(
+                    language.text(key),
+                    key,
+                    "{} is missing the essential translation for {key:?}",
+                    language.code()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn untranslated_specialist_text_falls_back_to_english() {
+        let japanese = LanguageId::from_code("ja").unwrap();
+        assert_eq!(
+            japanese.text("A future specialist label"),
+            "A future specialist label"
+        );
+    }
+
+    #[test]
+    fn supported_locale_codes_are_recognized() {
+        for (index, language) in LanguageId::ALL.into_iter().enumerate() {
+            assert_eq!(LanguageId::from_index(index), Some(language));
+            assert_eq!(
+                LanguageId::from_code(language.code()),
+                Some(language),
+                "{}",
+                language.code()
+            );
+        }
+
+        assert_eq!(LanguageId::from_code("tr_TR").unwrap().code(), "tr");
+        assert_eq!(LanguageId::from_code("zh-HK").unwrap().code(), "zh-TW");
+        assert_eq!(LanguageId::from_code("zh-SG").unwrap().code(), "zh-CN");
+    }
+
+    #[test]
+    fn generated_translation_catalogues_are_sorted_and_complete() {
+        let expected_keys = LanguageId::English.locale().translations.len();
+        assert!(expected_keys > 0);
+
+        for language in LanguageId::ALL {
+            let translations = language.locale().translations;
+            assert_eq!(translations.len(), expected_keys, "{}", language.code());
+            assert!(
+                translations.windows(2).all(|pair| pair[0].0 < pair[1].0),
+                "{} translations are not sorted",
+                language.code()
+            );
+            assert!(translations
+                .iter()
+                .all(|(_, value)| !value.trim().is_empty()));
+        }
     }
 }
