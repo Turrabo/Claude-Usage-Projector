@@ -28,6 +28,7 @@ use std::os::windows::process::CommandExt;
 use crate::csm::ipc::{ObserveMessage, ShutdownMessage, UsageBuckets};
 use crate::diagnose;
 use crate::models::{AppUsageData, UsageData};
+use crate::providers::ProviderId;
 
 const PREDICTOR_EXE: &str = "ccum-predictor.exe";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -87,8 +88,8 @@ pub fn record_observation(data: &AppUsageData, account_id: Option<&str>) {
     let observe = ObserveMessage::new(
         &timestamp,
         account_id,
-        data.claude_code.as_ref().map(buckets_from),
-        data.codex.as_ref().map(buckets_from),
+        data.get(ProviderId::Claude).map(buckets_from),
+        data.get(ProviderId::Codex).map(buckets_from),
     );
     let line = match serde_json::to_string(&observe) {
         Ok(s) => s,
