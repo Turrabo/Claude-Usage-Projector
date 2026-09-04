@@ -493,3 +493,30 @@ The forward roadmap, spikes, and open questions live in [`docs/REBUILD-PLAN.md`]
 - **De-risk before committing.** Two spikes gate the rebuild: (A) raw-Win32 taskbar child-window embedding from C#; (B) two concurrent persistent WebView2 sessions each reading a different account's usage. If both succeed, build with confidence; if the taskbar spike fights us, reconsider keeping CodeZeno's shell as a thin renderer driven by the C# data layer.
 - **Lesson:** a fork is the right call when you need most of what upstream does and will stay close to it. It stops paying off the moment your requirements diverge from upstream's core model — here, the moment "multi-account" collided with upstream's single-account premise. The sunk seven phases weren't wasted (the predictor and the prediction/UX design carry over), but the shell was always going to be a poor fit for a goal upstream doesn't share.
 
+---
+
+## ADR-016: Archive the repository; the daily upstream-sync is switched off
+
+**Date:** 2026-09-04
+**Status:** Accepted. Closes out ADR-007 (the daily upstream-sync workflow), which stays on the record as what was true while the fork was live.
+
+### Context
+
+ADR-015 froze the fork on 2026-05-27, but nothing switched off the machinery that assumed it was still live. The cron in `.github/workflows/upstream-sync.yml` kept running at 13:17 UTC every day, merging upstream and compiling the result.
+
+Upstream kept moving. It is now 49 commits ahead, v1.4.9 to v2.9.19, and in that span it moved to an eframe GUI stack, restructured `AppUsageData` around multiple providers, and took the `windows` crate to 0.62 (GDI handles no longer coerce to `HGDIOBJ`). The fork's own `src/csm/` files were written against the older shape, so every merged tree since 2026-08-21 has failed to compile: 55 errors, 33 in `popup.rs`, 30 in `badge.rs`, 2 in `sidecar.rs`, and none anywhere else.
+
+That is ADR-007 working exactly as designed. The gate caught a bad merge and refused to publish it, every single day, to a maintainer who had already stopped using the project. The only output was a daily failure email.
+
+Making it compile again was considered and rejected. The `.into()` and `BOOL` errors are mechanical, but the `AppUsageData` change is a real port, and the popup and badge hooks were written against a Win32 UI upstream has since replaced. A green build would not have meant a working widget, and the next structural upstream change would have broken it again.
+
+### Decision
+
+Archive `Turrabo/Claude-Usage-Projector` on GitHub, and remove the cron from `upstream-sync.yml` first so the schedule is gone in the tree itself rather than only suppressed by the archive flag. `workflow_dispatch` is kept, so reviving the fork means un-archiving and dispatching by hand, not reconstructing the job.
+
+### Consequences
+
+- **The emails stop, and no further scheduled work runs against this repo.** Archiving disables Actions; the cron removal means the schedule is also absent from the workflow file, so un-archiving does not quietly restart the daily failures.
+- **The repo stays public and readable.** It remains the working reference implementation and the home of the portable `predictor/`, which is what ADR-015 kept it for.
+- **Reviving it costs one un-archive plus a port of `src/csm/`.** The comment above `on:` says so, so whoever does it is not surprised by a first dispatch that fails to compile.
+- **Lesson:** retiring a project is not finished when the code stops changing. Anything on a schedule outlives the decision to stop, and keeps reporting to somebody who has stopped listening. Switch off the automation in the same change that declares the freeze.

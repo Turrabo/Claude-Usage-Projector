@@ -1,6 +1,8 @@
 # Claude-Usage-Projector — fork context
 
-> **⚠ RETIRED / FROZEN as of 2026-05-27.** This fork is no longer the active project. Development moved back to a single-stack **C# own-widget** (the "Claude Session Monitor" rebuild). The full reasoning is in [`DECISIONS.md`](DECISIONS.md) **ADR-015**; the forward roadmap is in [`docs/REBUILD-PLAN.md`](docs/REBUILD-PLAN.md).
+> **⚠ RETIRED / FROZEN as of 2026-05-27, and ARCHIVED on GitHub as of 2026-09-04.** This fork is no longer the active project. Development moved back to a single-stack **C# own-widget** (the "Claude Session Monitor" rebuild). The full reasoning is in [`DECISIONS.md`](DECISIONS.md) **ADR-015**; the forward roadmap is in [`docs/REBUILD-PLAN.md`](docs/REBUILD-PLAN.md).
+>
+> **The repository is read-only and no workflow will run.** Changing anything here means un-archiving it first, and a first `upstream-sync` dispatch after that will fail to compile until `src/csm/` is ported to upstream's current API. **ADR-016** says why.
 >
 > **If you're a future Claude agent landing here:** don't build new features on this repo. It is kept as (a) a working reference implementation and (b) the source of the portable C# **predictor** (`predictor/` — the three-tier Tier 1/2/3 model, idle-freeze, and JSONL persistence port directly into the rebuild). Everything below describes the fork's *frozen* state, **not a live roadmap** — the phase table in particular is historical. It was retired because its single-active-account + OAuth-API model could not deliver simultaneous live tracking of three accounts: there's no stable per-account identity in `~/.claude/.credentials.json` (`organizationUuid` is present for only some accounts; the rest is opaque rotating tokens), refresh-token rotation makes API polling of idle accounts unsafe, and the Rust+C# split was a recurring toolchain drag. The rebuild uses per-account WebView2 cookie-sessions (no OAuth refresh code) and raw-Win32 taskbar embedding from C#. See ADR-015 for the whole story.
 
@@ -39,7 +41,7 @@ The fork is designed to absorb upstream changes with minimal conflict:
 - **Upstream's `README.md` and `LICENSE` are not modified** — keep them as-is for clean fast-forwards from upstream
 - **One upstream file is fully replaced**: `.github/workflows/release.yml`. Upstream's submits to their WinGet package; ours bundles both binaries into a zip Release. Future upstream changes to that file will surface as a merge conflict, which is the intended divergence signal.
 
-A daily GitHub Actions workflow (`.github/workflows/upstream-sync.yml`) attempts a fast-forward merge from upstream; conflicts surface as failed runs for manual resolution.
+`.github/workflows/upstream-sync.yml` merges from upstream and compiles the result before publishing it. It ran daily until 2026-09-04 and is now **manual dispatch only**. The repository is archived, and upstream has moved far enough that `src/csm/` no longer compiles against it, so the daily run did nothing but mail a failure. [`DECISIONS.md`](DECISIONS.md) ADR-016 is the whole story; ADR-007 is the original design.
 
 ## Build & toolchain
 

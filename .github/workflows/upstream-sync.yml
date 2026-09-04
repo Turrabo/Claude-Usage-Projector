@@ -1,7 +1,7 @@
 name: upstream-sync
 
-# Daily attempt to merge upstream/main (CodeZeno/Claude-Code-Usage-Monitor)
-# into our main.
+# Merges upstream/main (CodeZeno/Claude-Code-Usage-Monitor) into our main. It ran
+# daily until 2026-09-04; see the note above `on:` for why it is now manual only.
 #
 # It runs on windows-latest and compiles the result BEFORE pushing, because nothing
 # downstream will: GitHub does not create a workflow run from a push authenticated
@@ -23,18 +23,21 @@ name: upstream-sync
 # A lockfile-only conflict is resolved here by regenerating the lockfile. Any other
 # conflict still fails visibly - resolve manually from a local clone.
 
+# Manual only. The daily cron was removed on 2026-09-04: this fork was retired in
+# ADR-015 and upstream has since rewritten the app it hooks into, so every run merged
+# a tree that could not compile and mailed a failure to the maintainer. Nothing
+# consumes the merge any more, so the schedule was pure noise. Reinstate the cron if
+# the fork is ever revived, and expect src/csm/ to need porting first.
 on:
-  schedule:
-    - cron: '17 13 * * *'  # 13:17 UTC daily
   workflow_dispatch:
 
 permissions:
   contents: write
 
-# The cron and a manual dispatch can otherwise overlap, and two jobs pushing main is
-# the same race this repo's siblings had to fix. Never cancel one mid-push. A third
-# run arriving while one is queued does cancel the queued one, which is harmless
-# here: every run does the same work and the next one picks up whatever is left.
+# Two dispatches can otherwise overlap, and two jobs pushing main is the same race
+# this repo's siblings had to fix. Never cancel one mid-push. A third run arriving
+# while one is queued does cancel the queued one, which is harmless here: every run
+# does the same work and the next one picks up whatever is left.
 concurrency:
   group: upstream-sync
   cancel-in-progress: false
